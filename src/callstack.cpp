@@ -22,6 +22,13 @@
 ////////////////////////////////////////////////////////////////////////////////
 
 #include "stdafx.h"
+
+#include <unordered_map>
+#include <stdint.h>
+#include <malloc.h>
+
+#include <new>
+
 #define VLDBUILD
 #include "callstack.h"  // This class' header.
 #include "utility.h"    // Provides various utility functions.
@@ -54,6 +61,18 @@ bool endWith(const LPCWSTR filename, size_t len, wchar_t const (&substr)[N])
     return ((len >= count) && wcsncmp(filename + len - count, substr, count) == 0);
 }
 
+Allocator CallStack::chunk_t::chunk_tpool(sizeof(SafeCallStack), 0, NULL, "chunk_tpool");
+CallStack::chunk_t *chunk_tCacheHead = nullptr;
+
+void release_chunk_t_cache()
+{
+    decltype(chunk_tCacheHead) chunk;
+    while (chunk = chunk_tCacheHead)
+    {
+        chunk_tCacheHead = chunk_tCacheHead->next;
+        delete chunk;
+    }
+}
 // Constructor - Initializes the CallStack with an initial size of zero and one
 //   Chunk of capacity.
 //
@@ -69,6 +88,14 @@ CallStack::CallStack ()
     m_resolvedCapacity   = 0;
     m_resolvedLength = 0;
 }
+#if 0
+CallStack::CallStack(void (*pdeleteme)(void*))
+    : CallStack()
+    
+{
+    deleteme = pdeleteme;
+}
+#endif
 
 // Destructor - Frees all memory allocated to the CallStack.
 //
@@ -77,30 +104,87 @@ CallStack::~CallStack ()
     CallStack::chunk_t *chunk = m_store.next;
     CallStack::chunk_t *temp;
 
-    while (chunk) {
-        temp = chunk;
-        chunk = temp->next;
-        delete temp;
-    }
+	{
+		CriticalSectionLocker<> cs(g_heapMapLock);
+		while (chunk) {
+			temp = chunk;
+			chunk = temp->next;
+#if 0
+			delete temp;
+#else
+			temp->next = chunk_tCacheHead;
+			chunk_tCacheHead = temp;
+#endif
+		}
+	}
 
-    delete [] m_resolved;
+    if (m_resolved != reinterpret_cast<decltype(m_resolved)>(1))
+        delete [] m_resolved;
 
     m_resolved = NULL;
     m_resolvedCapacity = 0;
     m_resolvedLength = 0;
 }
 
+Allocator SafeCallStack::safepool(sizeof(SafeCallStack), 0, NULL, "SafeCallStackPool");
+Allocator FastCallStack::fastpool(sizeof(SafeCallStack), 0, NULL, "FastCallStackPool");
+
+SafeCallStack *SafeCallStackCache = nullptr;
+FastCallStack *FastCallStackCache = nullptr;
+void release_safecallstack_cache()
+{
+    decltype(SafeCallStackCache) chunk;
+    while (chunk = SafeCallStackCache)
+    {
+        //SafeCallStackCache = SafeCallStackCache->next;
+        SafeCallStackCache = *(SafeCallStack**)SafeCallStackCache;
+        delete chunk;
+    }
+}
+void release_fastcallstack_cache()
+{
+    decltype(FastCallStackCache) chunk;
+    while (chunk = FastCallStackCache)
+    {
+        FastCallStackCache = *(FastCallStack**)FastCallStackCache;
+        delete chunk;
+    }
+}
+//#pragma push_macro("new")
+//#undef new
 CallStack* CallStack::Create()
 {
+    //TBD: Is there ever more than one of these outstanding?  *YES*.
+    //(so can't..) If not, dispense with dynamic allocation, just placement 'new' on top of local static and return...
     CallStack* result = NULL;
     if (g_vld.GetOptions() & VLD_OPT_SAFE_STACK_WALK) {
+        __debugbreak(); //TBD: don't think this branch is being taken with (my) current settings...
         result = new SafeCallStack();
+        //result = new SafeCallStack(SafeCallStack::operator delete );
     }
     else {
+#if 0
         result = new FastCallStack();
+        //result = new FastCallStack(FastCallStack::operator delete);
+#else
+        if (FastCallStackCache)
+        {
+            result = FastCallStackCache;
+            FastCallStackCache = *(FastCallStack**)FastCallStackCache;
+            #pragma push_macro("new")
+            #undef new
+            new (result) FastCallStack();
+            #pragma pop_macro("new")
+        }
+        else
+        {
+            result = new FastCallStack();
+        }
+#endif
     }
     return result;
 }
+//#pragma pop_macro("new")
 
 // operator == - Equality operator. Compares the CallStack to another CallStack
 //   for equality. Two CallStacks are equal if they are the same size and if
@@ -189,7 +273,8 @@ VOID CallStack::clear ()
     m_topIndex = 0;
     if (m_resolved)
     {
-        delete [] m_resolved;
+        if (m_resolved != reinterpret_cast<decltype(m_resolved)>(1))
+            delete [] m_resolved;
         m_resolved = NULL;
     }
     m_resolvedCapacity = 0;
@@ -332,13 +417,41 @@ bool CallStack::isCrtStartupAlloc()
 //
 void CallStack::dump(BOOL showInternalFrames)
 {
+    //if leak report requested > 1 time same execution context, seems you *will* encounter these __debugbreak()s!
+	if (++m_dumpCount > 1)
+		if (IsDebuggerPresent())
+			__debugbreak();
+
     if (!m_resolved) {
         resolve(showInternalFrames);
     }
 
-    // The stack was reoslved already
-    if (m_resolved) {
-        return Print(m_resolved);
+    // The stack was resolved already
+    if (m_resolved) { //TBD: Can we free m_resolved after printing, but leave m_resolved non-zero... (to avoid huge memory allocations growing while we're leak reporting???)
+		//presumably redundant, but we'll check anyway....
+		if (++m_resolvedPrintCount > 1)
+			if (IsDebuggerPresent())
+				__debugbreak();
+		//TBD: It *appears* that it may be possible to safely
+		//{
+		// auto retrn = Print(m_resolved);
+		// delete [] m_resolved;
+		// m_resolved = static_cast<decltype(m_resolved)>(1);
+		// return retrn;
+		//}
+		//to avoid accum'ing all of the m_resolved items which can be *quite* *large* in total (as I type this I'm watching
+		//a process that has so far added about 28Gb from ReportLeaks(), seemingly due to these allocations....  The application only
+		//had 10-12Gb upon starting to ReportLeaks(), is now up to about 39Gb.
+        //Such a change will require touching the various places that 'delete [] m_resolved' and make them subject to if(m_resolved != (whatevercast)1)!!!
+        //return Print(m_resolved); //Wow! Never noticed that possibility before (return functionreturningvoid())
+        if(m_resolved != reinterpret_cast<decltype(m_resolved)>(1))
+        {
+            auto nchars = wcslen(m_resolved);
+            Print(m_resolved, nchars);
+            delete [] m_resolved;
+            m_resolved = reinterpret_cast<decltype(m_resolved)>(1);
+        }
+        return;
     }
 }
 
@@ -356,8 +469,35 @@ void CallStack::dump(BOOL showInternalFrames)
 //
 //    None.
 //
+//std::unordered_map<DWORD, uint64_t> stdframesMapped;
+#if 01
+template<class _Kty,
+    class _Ty,
+    //class _Pr = std::less<_Kty>,
+    class Hash = std::hash<_Kty>,
+    class KeyEqual = std::equal_to<_Kty>,
+    //class _Alloc = vld_stl_allocator<std::pair<const _Kty, _Ty> > >
+    class _Alloc = VLDCustomAlloc<std::pair<const _Kty, _Ty> > >
+    class vldunordered_map
+    //: public std::unordered_map<_Kty, _Ty, _Pr, _Alloc>
+    : public std::unordered_map<_Kty, _Ty, Hash, KeyEqual, _Alloc>
+{
+}; 
+#endif
+//vldunordered_map<DWORD, unsigned long long> framesMapped;
+//vld's heap not init'd before trying to init this in global space, so, delay into resolve() so
+//it will only be constructed after vld's internal heap is available.
+//vldunordered_map<unsigned, unsigned long long> framesMapped;
+
+static uint64_t nextResolvedCount = 0;
 int CallStack::resolve(BOOL showInternalFrames)
 {
+    static vldunordered_map<unsigned, unsigned long long> framesMapped;
+    
+    if (++m_resolvedCount > 1)
+		if (IsDebuggerPresent())
+			__debugbreak();
+
     if (m_resolved)
     {
         // already resolved, no need to do it again
@@ -398,6 +538,37 @@ int CallStack::resolve(BOOL showInternalFrames)
     m_resolved = new WCHAR[m_resolvedCapacity];
     if (m_resolved) {
         ZeroMemory(m_resolved, allocedBytes);
+#if 0 //starting to not trust this... are crc's close enough to be misleading???
+        //A crude attempt to avoid re-resolving same stackframes repeatedly, as it seems pretty slow...
+        //downside:  If crc's for two differing stack frames are same, we'll not correctly report.
+
+        DWORD crc = 0;
+        for (UINT32 frameidx = 0; frameidx < m_size; frameidx++)
+        {
+            SIZE_T programCounter = (*this)[frameidx];
+            crc = CalculateCRC32(programCounter, crc);
+        }
+        //.find() blowing up when empty...
+        //auto mappedFrame = framesMapped.find(crc);
+        //See if can avoid the 'empty' .find failure...
+        decltype(framesMapped.find(crc)) mappedFrameIt = framesMapped.end();
+        if (framesMapped.size())
+        {
+            mappedFrameIt = framesMapped.find(crc);
+        }
+        if( mappedFrameIt != framesMapped.end() )
+        {
+            //We've mapped this frame before, just output reference to it and return
+            swprintf(m_resolved, L"crc %u, prev stackframe resolution #%llu\n", crc, mappedFrameIt->second);
+            return 0;
+        }
+        else
+        {
+            //not seem this crc, record it, assign and report frame number, and proceed to resolve
+            framesMapped[crc] = ++nextResolvedCount;
+            swprintf(m_resolved, L"crc %u, new stackframe resolution #%llu\n", crc, nextResolvedCount);
+        }
+#endif
     }
 
     // Iterate through each frame in the call stack.
@@ -418,7 +589,8 @@ int CallStack::resolve(BOOL showInternalFrames)
                 m_status |= isCrtStartupFunction(functionName);
             }
             if (m_status & CALLSTACK_STATUS_STARTUPCRT) {
-                delete[] m_resolved;
+                if (m_resolved != reinterpret_cast<decltype(m_resolved)>(1))
+                    delete[] m_resolved;
                 m_resolved = NULL;
                 m_resolvedCapacity = 0;
                 m_resolvedLength = 0;
@@ -486,11 +658,29 @@ const WCHAR* CallStack::getResolvedCallstack( BOOL showinternalframes )
 //
 //    None.
 //
+//#pragma push_macro("new")
+//#undef new
 VOID CallStack::push_back (const UINT_PTR programcounter)
 {
     if (m_size == m_capacity) {
         // At current capacity. Allocate additional storage.
+#if 0
         CallStack::chunk_t *chunk = new CallStack::chunk_t;
+#else
+        CallStack::chunk_t *chunk;
+		{
+			CriticalSectionLocker<> cs(g_heapMapLock);
+			if (chunk_tCacheHead)
+			{
+				chunk = chunk_tCacheHead;
+				chunk_tCacheHead = chunk_tCacheHead->next;
+			}
+			else
+			{
+				chunk = new CallStack::chunk_t;
+			}
+		}
+#endif
         chunk->next = NULL;
         m_topChunk->next = chunk;
         m_topChunk = chunk;
@@ -509,6 +699,7 @@ VOID CallStack::push_back (const UINT_PTR programcounter)
     m_topChunk->frames[m_topIndex++] = programcounter;
     m_size++;
 }
+//#pragma pop_macro("new")
 
 UINT CallStack::isCrtStartupFunction( LPCWSTR functionName ) const
 {
@@ -666,7 +857,8 @@ VOID FastCallStack::getStackTrace (UINT32 maxdepth, const context_t& context)
     }
 #elif defined(_M_X64)*/
     UINT32 maxframes = min(62, maxdepth + 10);
-    UINT_PTR* myFrames = new UINT_PTR[maxframes];
+    //UINT_PTR* myFrames = new UINT_PTR[maxframes];
+    UINT_PTR *myFrames = (UINT_PTR *)_alloca(maxframes*sizeof(UINT_PTR));
     ZeroMemory(myFrames, sizeof(UINT_PTR) * maxframes);
     ULONG BackTraceHash;
     maxframes = RtlCaptureStackBackTrace(0, maxframes, reinterpret_cast<PVOID*>(myFrames), &BackTraceHash);
@@ -675,18 +867,20 @@ VOID FastCallStack::getStackTrace (UINT32 maxdepth, const context_t& context)
     while (count < maxframes) {
         if (myFrames[count] == 0)
             break;
+        //TBD: So, possibility of context.fp appearing > 1 time, or could we break' on first one found???
         if (myFrames[count] == context.fp)
             startIndex = count;
         count++;
     }
     count = startIndex;
+    //TBD: Speed up somehow... avoid funccall overhead?...  append(&myFrames, count, maxframes);
     while (count < maxframes) {
         if (myFrames[count] == 0)
             break;
         push_back(myFrames[count]);
         count++;
     }
-    delete [] myFrames;
+    //delete [] myFrames;
 //#endif
 }
 

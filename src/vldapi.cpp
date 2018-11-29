@@ -37,6 +37,14 @@ extern VisualLeakDetector g_vld;
 
 extern "C" {
 
+__declspec(dllexport) void VLDReportStats()
+{
+    g_vld.reportSomeStats();
+}
+__declspec(dllexport) std::size_t VLDNextAllocSeqNum()
+{
+	return g_vld.nextAllocSeq();
+}
 __declspec(dllexport) void VLDDisable ()
 {
     g_vld.DisableLeakDetection();
@@ -151,6 +159,35 @@ __declspec(dllexport) int VLDResolveCallstacks()
 __declspec(dllexport) const wchar_t* VldInternalGetAllocationCallstack(void* alloc, BOOL showInternalFrames)
 {
     return g_vld.GetAllocationResolveResults(alloc, showInternalFrames);
+}
+
+__declspec(dllexport) UINT VLDBumpCheckPoint()
+{
+    return (UINT)g_vld.BumpCheckPoint();
+}
+__declspec(dllexport) UINT VLDBumpReportCheckPoint(CONST WCHAR *blurb)
+{
+    VLDReportStats();
+    decltype(VLDBumpCheckPoint()) ckpt = VLDBumpCheckPoint();
+    Report(L"next checkpointval %u, seqno %llu, %s\n", ckpt, VLDNextAllocSeqNum(), blurb);
+
+    return ckpt;
+}
+__declspec(dllexport) UINT VLDBumpReportCheckPointA(CONST char *ablurb)
+{
+    VLDReportStats();
+    decltype(VLDBumpCheckPoint()) ckpt = VLDBumpCheckPoint();
+    Report(L"next checkpointval %u, seqno %llu, %S\n", ckpt, VLDNextAllocSeqNum(), ablurb);
+
+    return ckpt;
+}
+__declspec(dllexport) void VLDPauseTracking()
+{
+    g_vld.SetOption(VLD_OPT_TRACKING_PAUSED);
+}
+__declspec(dllexport) void VLDResumeTracking()
+{
+    g_vld.ClearOption(VLD_OPT_TRACKING_PAUSED);
 }
 
 }

@@ -32,6 +32,11 @@
 #include <windows.h>
 #include "utility.h"
 
+//#pragma push_macro("new")
+//#undef new
+#include "Allocator.h"
+//#pragma pop_macro("new")
+
 #define CALLSTACK_CHUNK_SIZE    32	// Number of frame slots in each CallStack chunk.
 #define MAX_SYMBOL_NAME_LENGTH  256 // Maximum symbol name length that we will allow. Longer names will be truncated.
 #define MAX_SYMBOL_NAME_SIZE    ((MAX_SYMBOL_NAME_LENGTH * sizeof(WCHAR)) - 1)
@@ -75,10 +80,14 @@
 //    properly de-allocated at a later time. However there is no other way to work around the
 //    fact that the call stacks can only get formatted when the binary is loaded in the process.
 //
+#pragma push_macro("new")
+#undef new
 class CallStack
 {
 public:
     CallStack ();
+    //CallStack(void (*p_deleteme)(void *));
+
     virtual ~CallStack ();
     static CallStack* Create();
     // Public APIs - see each function definition for details.
@@ -98,6 +107,28 @@ public:
     UINT_PTR operator [] (UINT32 index) const;
     VOID push_back (const UINT_PTR programcounter);
 
+    void (*deleteme)(void *p);
+
+    // The chunk list is made of a linked list of Chunks.
+    struct chunk_t {
+        static Allocator chunk_tpool;
+        chunk_t*    next;					    // Pointer to the next chunk in the chunk list.
+        UINT_PTR    frames[CALLSTACK_CHUNK_SIZE]; // Pushed frames (program counter addresses) are stored in this array.
+#if 0
+        void * operator new(size_t size)
+        {
+            void * p = chunk_tpool.Allocate(size);
+
+            return p;
+        }
+        void operator delete(void * p)
+        {
+            chunk_tpool.Deallocate(p);
+        }
+#endif
+
+    };
+
 protected:
     // Protected data.
     UINT32 m_status;                       // Status flags:
@@ -105,18 +136,17 @@ protected:
 #define CALLSTACK_STATUS_STARTUPCRT    0x2 //   If set, the stack trace is startup CRT.
 #define CALLSTACK_STATUS_NOTSTARTUPCRT 0x4 //   If set, the stack trace is not startup CRT.
 
-    // The chunk list is made of a linked list of Chunks.
-    struct chunk_t {
-        chunk_t*    next;					    // Pointer to the next chunk in the chunk list.
-        UINT_PTR    frames[CALLSTACK_CHUNK_SIZE]; // Pushed frames (program counter addresses) are stored in this array.
-    };
-
     // Private data.
     UINT32              m_capacity; // Current capacity limit (in frames)
     UINT32              m_size;     // Current size (in frames)
     CallStack::chunk_t  m_store;    // Pointer to the underlying data store (i.e. head of the chunk list)
     CallStack::chunk_t* m_topChunk; // Pointer to the chunk at the top of the stack
     UINT32              m_topIndex; // Index, within the top chunk, of the top of the stack
+
+	//reveng diag, are resolve attempts made more than once?
+	UINT32              m_resolvedCount = 0;
+	UINT32				m_dumpCount = 0;
+	UINT32				m_resolvedPrintCount = 0;
 
     // The string that contains the stack converted into a human readable format.
     // This is always NULL if the callstack has not been 'converted'.
@@ -148,17 +178,37 @@ private:
 //
 class FastCallStack : public CallStack
 {
+    static Allocator fastpool;
+
 public:
     FastCallStack()
         : m_hashValue(0)
     {
     }
+#if 0
+    FastCallStack(void (*p)(void*))
+    {
+        deleteme = p;
+        m_hashValue = 0;
+    }
+#endif
     virtual VOID getStackTrace (UINT32 maxdepth, const context_t& context);
     virtual DWORD getHashValue() const
     {
         return m_hashValue;
     }
+#if 0
+    void * operator new(size_t size)
+    {
+        void * p = fastpool.Allocate(size);
 
+        return p;
+    }
+    void operator delete(void * p)
+    {
+        fastpool.Deallocate(p);
+    }
+#endif
 private:
     UINT32 m_hashValue;
 };
@@ -172,7 +222,27 @@ private:
 //
 class SafeCallStack : public CallStack
 {
+    static Allocator safepool;
 public:
+#if 0
+    SafeCallStack(void(*p)(void*))
+    {
+        deleteme = p;
+    }
+#endif
     virtual VOID getStackTrace (UINT32 maxdepth, const context_t& context);
     virtual DWORD getHashValue() const;
+#if 0
+    void * operator new(size_t size)
+    {
+        void * p = safepool.Allocate(size);
+
+        return p;
+    }
+    void operator delete(void * p)
+    {
+        safepool.Deallocate(p);
+    }
+#endif
 };
+#pragma pop_macro("new")

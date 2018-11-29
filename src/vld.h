@@ -52,6 +52,10 @@ typedef void*          VLD_HMODULE;
 extern "C" {
 #endif // __cplusplus
 
+__declspec(dllimport) void VLDReportStats();
+__declspec(dllimport)	VLD_SIZET AllocSeqNumber ();
+__declspec(dllimport)	VLD_SIZET VLDNextAllocSeqNum();
+
 // VLDDisable - Disables Visual Leak Detector's memory leak detection at
 //   runtime. If memory leak detection is already disabled, then calling this
 //   function has no effect.
@@ -316,7 +320,14 @@ __declspec(dllimport) int VLDSetReportHook(int mode,  VLD_REPORT_HOOK pfnNewHook
 //
 //    int: 0 if successfully resolved all callstacks.
 //
+//TBD: Was that s'posed dto be dllEXport?
 __declspec(dllexport) int VLDResolveCallstacks();
+
+__declspec(dllimport) UINT VLDBumpCheckPoint();
+__declspec(dllimport) UINT VLDBumpReportCheckPoint(CONST WCHAR *blurb);
+__declspec(dllexport) UINT VLDBumpReportCheckPointA(CONST char *ablurb);
+__declspec(dllimport) void VLDPauseTracking();
+__declspec(dllimport) void VLDResumeTracking();
 
 #ifdef __cplusplus
 }
@@ -346,5 +357,7 @@ __declspec(dllexport) int VLDResolveCallstacks();
 #define VLDGetModulesList(a, b) (FALSE)
 #define VLDSetReportOptions(a, b)
 #define VLDResolveCallstacks() (0)
+#define VLDBumpCheckPoint() (0)
+#define VLDBumpReportCheckPoint(blurb) (0);
 
 #endif // _DEBUG

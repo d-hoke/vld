@@ -69,6 +69,8 @@ patchentry_t VisualLeakDetector::m_kernel32Patch [] = {
     "HeapDestroy",        NULL,                     _HeapDestroy,
     "HeapFree",           (LPVOID*)&m_HeapFree,     _HeapFree,
     "HeapReAlloc",        NULL,                     _HeapReAlloc,
+    //TBD: RtlCreateHeap?
+    //TBD: RtlDestroyHeap?
     NULL,                 NULL,                     NULL
 };
 

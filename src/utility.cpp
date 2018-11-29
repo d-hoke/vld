@@ -671,13 +671,13 @@ BOOL PatchModule (HMODULE importmodule, moduleentry_t patchtable [], UINT tables
     return patched;
 }
 
-int CallReportHook(int reportType, LPWSTR message, int* hook_retval)
+int CallReportHook(int reportType, LPWSTR message, unsigned nchars, int* hook_retval)
 {
     if (g_pReportHooks == NULL)
         return 0;
     for (ReportHookSet::Iterator it = g_pReportHooks->begin(); it != g_pReportHooks->end(); ++it)
     {
-        int result = (*it)(reportType, message, hook_retval);
+        int result = (*it)(reportType, message, nchars, hook_retval);
         if (result) // handled
             return result;
     }
@@ -696,19 +696,25 @@ int CallReportHook(int reportType, LPWSTR message, int* hook_retval)
 //
 //    None.
 //
-VOID Print (LPWSTR messagew)
+VOID PrintFlush()
+{
+    //In event of a report hook, this should just safely return an error which we'll ignore.
+    fflush(s_reportFile);
+}
+VOID Print (LPWSTR messagew, unsigned nchars)
 {
     if (NULL == messagew)
         return;
 
     int hook_retval=0;
-    if (!CallReportHook(0, messagew, &hook_retval))
+    if (!CallReportHook(0, messagew, nchars, &hook_retval))
     {
         if (s_reportEncoding == unicode) {
             if (s_reportFile != NULL) {
                 // Send the report to the previously specified file.
-                fwrite(messagew, sizeof(WCHAR), wcslen(messagew), s_reportFile);
-            }
+                //fwrite(messagew, sizeof(WCHAR), wcslen(messagew), s_reportFile);
+				fwrite(messagew, sizeof(WCHAR), nchars, s_reportFile);
+			}
 
             if ( s_reportToStdOut )
                 fputws(messagew, stdout);
@@ -717,20 +723,25 @@ VOID Print (LPWSTR messagew)
             const size_t MAXMESSAGELENGTH = 5119;
             size_t  count = 0;
             CHAR    messagea [MAXMESSAGELENGTH + 1];
-            if (wcstombs_s(&count, messagea, MAXMESSAGELENGTH + 1, messagew, _TRUNCATE) != 0) {
-                // Failed to convert the Unicode message to ASCII.
-                assert(FALSE);
-                return;
-            }
-            messagea[MAXMESSAGELENGTH] = '\0';
+			if (s_reportFile || s_reportToStdOut)
+			{
+				if (wcstombs_s(&count, messagea, MAXMESSAGELENGTH + 1, messagew, _TRUNCATE) != 0) {
+					// Failed to convert the Unicode message to ASCII.
+					assert(FALSE);
+					//can still report to debugger.... don't -> return;
+				}
+				else {
+					messagea[MAXMESSAGELENGTH] = '\0';
 
-            if (s_reportFile != NULL) {
-                // Send the report to the previously specified file.
-                fwrite(messagea, sizeof(CHAR), strlen(messagea), s_reportFile);
-            }
+					if (s_reportFile != NULL) {
+						// Send the report to the previously specified file.
+						fwrite(messagea, sizeof(CHAR), strlen(messagea), s_reportFile);
+					}
 
-            if ( s_reportToStdOut )
-                fputs(messagea, stdout);
+					if (s_reportToStdOut)
+						fputs(messagea, stdout);
+				}
+			}
 		}
 
 		if (s_reportToDebugger)
@@ -759,6 +770,10 @@ VOID Print (LPWSTR messagew)
 //
 //    None.
 //
+VOID ReportFlush()
+{
+    PrintFlush();
+}
 VOID Report (LPCWSTR format, ...)
 {
     va_list args;
@@ -770,7 +785,7 @@ VOID Report (LPCWSTR format, ...)
     messagew[MAXREPORTLENGTH] = L'\0';
 
     if (result >= 0)
-        Print(messagew);
+        Print(messagew, result);
 }
 
 // RestoreImport - Restores the IAT entry for an import previously patched via

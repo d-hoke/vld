@@ -154,6 +154,7 @@
       <FunctionLevelLinking>false</FunctionLevelLinking>
       <DisableSpecificWarnings>4201;4229;4091;4302;4311;4312;4127</DisableSpecificWarnings>
       <EnablePREfast>false</EnablePREfast>
+      <ExceptionHandling>Async</ExceptionHandling>
     </ClCompile>
     <Link>
       <OptimizeReferences>true</OptimizeReferences>
@@ -169,6 +170,7 @@
     </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="Allocator.cpp" />
     <ClCompile Include="callstack.cpp" />
     <ClCompile Include="dllspatches.cpp" />
     <ClCompile Include="ntapi.cpp" />

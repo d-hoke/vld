@@ -34,6 +34,7 @@
 #undef new
 #include <string>
 #include <memory>
+#include "Allocator.h"
 #pragma pop_macro("new")
 #include <windows.h>
 #include "vld_def.h"
@@ -44,6 +45,9 @@
 #include "set.h"        // Provides a custom STL-like set template.
 #include "utility.h"    // Provides miscellaneous utility functions.
 #include "vldallocator.h"   // Provides internal allocator.
+#include "btree_container.h"
+#include "btree_map.h"
+//didn't seem to help btree key_compare_checker issues... #include <functional>
 
 #define MAXMODULELISTLENGTH 512     // Maximum module list length, in characters.
 #define SELFTESTTEXTA       "Memory Leak Self-Test"
@@ -56,9 +60,16 @@
 #endif
 
 // The Visual Leak Detector APIs.
+extern "C" __declspec(dllexport) void VLDReportStats();
+extern "C" __declspec(dllexport) std::size_t VLDNextAllocSeqNum();
 extern "C" __declspec(dllexport) void VLDDisable ();
 extern "C" __declspec(dllexport) void VLDEnable ();
 extern "C" __declspec(dllexport) void VLDRestore ();
+extern "C" __declspec(dllexport) UINT VLDBumpCheckPoint();
+extern "C" __declspec(dllexport) UINT VLDBumpReportCheckPoint(CONST WCHAR *blurb);
+extern "C" __declspec(dllexport) UINT VLDBumpReportCheckPointA(CONST char *ablurb);
+extern "C" __declspec(dllexport) void VLDPauseTracking();
+extern "C" __declspec(dllexport) void VLDResumeTracking();
 
 // Function pointer types for explicit dynamic linking with functions listed in
 // the import patch table.
@@ -103,18 +114,50 @@ typedef void* (__cdecl *_aligned_offset_recalloc_dbg_t) (void *, size_t, size_t,
 // The data is stored in this structure and these structures are stored in
 // a BlockMap which maps each of these structures to its corresponding memory
 // block.
+//#pragma push_macro("new")
+//#undef new
 struct blockinfo_t {
+    static Allocator blockinfopool;
     std::unique_ptr<CallStack> callStack;
+    //std::unique_ptr<CallStack, void (*)(void *p)> callStack;
     DWORD      threadId;
     SIZE_T     serialNumber;
     SIZE_T     size;
     bool       reported;
     bool       debugCrtAlloc;
     bool       ucrt;
+    LPCVOID    memaddr; //sanity check, looking for 'new allocation at already allocated address'
+    UINT_PTR   funcaddr;
+    int        freecnt;
+    unsigned   checkpointval;
+#if 0
+    void * operator new(size_t size)
+    {
+        void * p = blockinfopool.Allocate(size);
+
+        return p;
+    }
+    void operator delete(void * p)
+    {
+        blockinfopool.Deallocate(p);
+    }
+#endif
 };
+//#pragma pop_macro("new")
 
 // BlockMaps map memory blocks (via their addresses) to blockinfo_t structures.
-typedef Map<LPCVOID, blockinfo_t*> BlockMap;
+//typedef Map<LPCVOID, blockinfo_t*> BlockMap; //TBD: unordered_map any faster?  (ordered_)map necessary?
+//typedef std::unordered_map<LPCVOID, blockinfo_t*> BlockMap; //TBD: unordered_map any faster?  (ordered_)map necessary?
+//typedef btree::btree_map<LPCVOID, blockinfo_t *> BlockMap2;
+#define ALTBLKMAP 1
+//typedef btree::btree_map<LPCVOID, blockinfo_t *, std::less<LPCVOID> > BlockMap;
+typedef btree::btree_map<LPCVOID, blockinfo_t *, std::less<LPCVOID>, vld_stl_allocator<char> > BlockMap;
+//typedef btree::btree_map<INT64, blockinfo_t *> BlockMap2;
+//typedef btree::btree_map<int, int> BlockMap2;
+//typedef btree::btree_map<int32_t, int32_t, std::less<int32_t>> BlockMap2;
+//using namespace btree;
+//typedef btree_map<int, int> BlockMap2;
+
 
 // Information about each heap in the process is kept in this map. Primarily
 // this is used for mapping heaps to all of the blocks allocated from those
@@ -125,8 +168,10 @@ struct heapinfo_t {
 };
 
 // HeapMaps map heaps (via their handles) to BlockMaps.
-typedef Map<HANDLE, heapinfo_t*> HeapMap;
+typedef Map<HANDLE, heapinfo_t*> HeapMap; //TBD: unordered_map any faster?  (ordered_)map necessary?
+//typedef std::unordered_map<HANDLE, heapinfo_t*> HeapMap; //TBD: unordered_map any faster?  (ordered_)map necessary?
 typedef std::basic_string<wchar_t, std::char_traits<wchar_t>, vldallocator<wchar_t> > vldstring;
+
 
 // This structure stores information, primarily the virtual address range, about
 // a given module and can be used with the Set template because it supports the
@@ -173,6 +218,7 @@ struct tls_t {
     LPVOID      blockWithoutGuard; // Store pointer to block.
     LPVOID      newBlockWithoutGuard;
     SIZE_T      size;
+    SIZE_T      oldsize;
 };
 
 // Allocation state:
@@ -201,6 +247,8 @@ private:
     tls_t *m_tls;
     BOOL m_bFirst;
     const context_t& m_context;
+    DWORD m_ThreadId;
+    HANDLE m_hThread;
 };
 
 class CallStack;
@@ -268,7 +316,10 @@ public:
     VOID EnableModule(HMODULE module);
     VOID DisableModule(HMODULE module);
     UINT32 GetOptions();
+    const UINT32 &refOptions() const { return m_options; }
     VOID GetReportFilename(WCHAR *filename);
+    VOID SetOption(UINT32 option);
+    VOID ClearOption(UINT32 option);
     VOID SetOptions(UINT32 option_mask, SIZE_T maxDataDump, UINT32 maxTraceFrames);
     VOID SetReportOptions(UINT32 option_mask, CONST WCHAR *filename);
     int  SetReportHook(int mode, VLD_REPORT_HOOK pfnNewHook);
@@ -290,6 +341,16 @@ public:
     static NTSTATUS NTAPI _LdrLockLoaderLock(IN ULONG Flags, OUT PULONG Disposition OPTIONAL, OUT PULONG_PTR Cookie OPTIONAL);
     static NTSTATUS NTAPI _LdrUnlockLoaderLock(IN ULONG Flags, IN ULONG_PTR Cookie OPTIONAL);
 
+    std::size_t nextAllocSeq() {
+		return m_requestCurr;
+	};
+
+    void reportSomeStats();
+
+    bool m_avoidFills;
+    uint32_t m_checkpointval;
+    decltype(m_checkpointval) BumpCheckPoint() { return ++m_checkpointval; }
+
 private:
     ////////////////////////////////////////////////////////////////////////////////
     // Private leak detection functions - see each function definition for details.
@@ -300,9 +361,11 @@ private:
     BOOL GetIniFilePath(LPTSTR lpPath, SIZE_T cchPath);
     VOID   configure ();
     BOOL   enabled ();
-    SIZE_T eraseDuplicates (const BlockMap::Iterator &element, Set<blockinfo_t*> &aggregatedLeak);
+    //SIZE_T eraseDuplicates (const BlockMap::Iterator &element, Set<blockinfo_t*> &aggregatedLeak);
+    SIZE_T eraseDuplicates(const BlockMap::iterator &element, Set<blockinfo_t*> &aggregatedLeak);
+    //SIZE_T eraseDuplicates(blockinfo_t *elementinfo, Set<blockinfo_t*> &aggregatedLeak);
     tls_t* getTls ();
-    VOID   mapBlock (HANDLE heap, LPCVOID mem, SIZE_T size, bool crtalloc, bool ucrt, DWORD threadId, blockinfo_t* &pblockInfo);
+    VOID   mapBlock (HANDLE heap, LPCVOID mem, SIZE_T size, bool crtalloc, bool ucrt, DWORD threadId, blockinfo_t* &pblockInfo, const context_t &context, unsigned flags=0);
     VOID   mapHeap (HANDLE heap);
     VOID   remapBlock (HANDLE heap, LPCVOID mem, LPCVOID newmem, SIZE_T size,
         bool crtalloc, bool ucrt, DWORD threadId, blockinfo_t* &pblockInfo, const context_t &context);
@@ -312,9 +375,9 @@ private:
     static int    getCrtBlockUse (LPCVOID block, bool ucrt);
     static size_t getCrtBlockSize(LPCVOID block, bool ucrt);
     SIZE_T getLeaksCount (heapinfo_t* heapinfo, DWORD threadId = (DWORD)-1);
-    SIZE_T reportLeaks(heapinfo_t* heapinfo, bool &firstLeak, Set<blockinfo_t*> &aggregatedLeaks, DWORD threadId = (DWORD)-1);
+    SIZE_T reportLeaks(heapinfo_t* heapinfo, bool &firstLeak, Set<blockinfo_t*> &aggregatedLeaks, DWORD threadId = (DWORD)-1, SIZE_T cntOfBlocks = 0);
     VOID   markAllLeaksAsReported (heapinfo_t* heapinfo, DWORD threadId = (DWORD)-1);
-    VOID   unmapBlock (HANDLE heap, LPCVOID mem, const context_t &context);
+    VOID   unmapBlock (HANDLE heap, LPCVOID mem, const context_t &context, bool avoidContextUse=false);
     VOID   unmapHeap (HANDLE heap);
     int    resolveStacks(heapinfo_t* heapinfo);
 
@@ -402,6 +465,7 @@ private:
     static GetProcessHeap_t m_GetProcessHeap;
     static HeapCreate_t m_HeapCreate;
     static HeapFree_t m_HeapFree;
+
 };
 
 

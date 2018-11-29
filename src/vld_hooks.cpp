@@ -27,6 +27,9 @@
 
 #include <sys/stat.h>
 
+#include <vector>
+#include <algorithm>
+
 #define VLDBUILD         // Declares that we are building Visual Leak Detector.
 #include "callstack.h"   // Provides a class for handling call stacks.
 #include "crtmfcpatch.h" // Provides CRT and MFC patch functions.
@@ -41,6 +44,7 @@
 extern HANDLE           g_currentProcess;
 extern CriticalSection  g_heapMapLock;
 extern DbgHelp g_DbgHelp;
+extern HANDLE            g_vldHeap;
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -90,8 +94,10 @@ HANDLE VisualLeakDetector::_GetProcessHeap()
 //
 //    Returns the value returned by HeapCreate.
 //
+static uint64_t cnt_HeapCreateCalls = 0;
 HANDLE VisualLeakDetector::_HeapCreate (DWORD options, SIZE_T initsize, SIZE_T maxsize)
 {
+	++cnt_HeapCreateCalls;
     PRINT_HOOKED_FUNCTION();
     // Create the heap.
     HANDLE heap = m_HeapCreate(options, initsize, maxsize);
@@ -117,8 +123,10 @@ HANDLE VisualLeakDetector::_HeapCreate (DWORD options, SIZE_T initsize, SIZE_T m
 //
 //    Returns the valued returned by HeapDestroy.
 //
+static uint64_t cnt_HeapDestroyCalls = 0;
 BOOL VisualLeakDetector::_HeapDestroy (HANDLE heap)
 {
+	++cnt_HeapDestroyCalls;
     PRINT_HOOKED_FUNCTION();
     // After this heap is destroyed, the heap's address space will be unmapped
     // from the process's address space. So, we'd better generate a leak report
@@ -148,39 +156,52 @@ BOOL VisualLeakDetector::_HeapDestroy (HANDLE heap)
 //
 //    Returns the return value from RtlAllocateHeap.
 //
+static uint64_t cnt_RtlAllocateHeapCalls = 0;
+static uint64_t cnt_RtlAllocateHeapSkippedLock = 0;
 LPVOID VisualLeakDetector::_RtlAllocateHeap (HANDLE heap, DWORD flags, SIZE_T size)
 {
+	++cnt_RtlAllocateHeapCalls;
     PRINT_HOOKED_FUNCTION2();
     // Allocate the block.
     LPVOID block = RtlAllocateHeap(heap, flags, size);
 
+    if ((g_vld.refOptions() & VLD_OPT_TRACKING_PAUSED))
+        return block;
     if ((block == NULL) || !g_vld.enabled())
         return block;
 
-    if (!g_DbgHelp.IsLockedByCurrentThread()) { // skip dbghelp.dll calls
-        CAPTURE_CONTEXT();
-        CaptureContext cc(RtlAllocateHeap, context_);
-        cc.Set(heap, block, NULL, size);
-    }
-
+	if (!g_DbgHelp.IsLockedByCurrentThread()) { // skip dbghelp.dll calls
+		CAPTURE_CONTEXT();
+		CaptureContext cc(RtlAllocateHeap, context_);
+		cc.Set(heap, block, NULL, size);
+	}
+	else
+		++cnt_RtlAllocateHeapSkippedLock;
     return block;
 }
 
+static uint64_t cnt_HeapAllocCalls = 0;
+static uint64_t cnt_HeapAllocSkippedLock = 0;
 // HeapAlloc (kernel32.dll) call RtlAllocateHeap (ntdll.dll)
 LPVOID VisualLeakDetector::_HeapAlloc (HANDLE heap, DWORD flags, SIZE_T size)
 {
+	++cnt_HeapAllocCalls;
     PRINT_HOOKED_FUNCTION2();
     // Allocate the block.
     LPVOID block = HeapAlloc(heap, flags, size);
 
+    if ((g_vld.refOptions() & VLD_OPT_TRACKING_PAUSED))
+        return block;
     if ((block == NULL) || !g_vld.enabled())
         return block;
 
-    if (!g_DbgHelp.IsLockedByCurrentThread()) { // skip dbghelp.dll calls
-        CAPTURE_CONTEXT();
-        CaptureContext cc(HeapAlloc, context_);
-        cc.Set(heap, block, NULL, size);
-    }
+	if (!g_DbgHelp.IsLockedByCurrentThread()) { // skip dbghelp.dll calls
+		CAPTURE_CONTEXT();
+		CaptureContext cc(HeapAlloc, context_);
+		cc.Set(heap, block, NULL, size);
+	}
+	else
+		++cnt_HeapAllocSkippedLock;
 
     return block;
 }
@@ -200,43 +221,547 @@ LPVOID VisualLeakDetector::_HeapAlloc (HANDLE heap, DWORD flags, SIZE_T size)
 //
 //    Returns the value returned by RtlFreeHeap.
 //
+//dlh - seems can get to RtlFreeHeap from/via
+// Deallocate() -> delete -> free -> imp_free
+#if 01
+template<class _Kty,
+	class _Ty,
+	//class _Pr = std::less<_Kty>,
+	class Hash = std::hash<_Kty>,
+	class KeyEqual = std::equal_to<_Kty>,
+	//class _Alloc = vld_stl_allocator<std::pair<const _Kty, _Ty> > >
+	class _Alloc = VLDCustomAlloc<std::pair<const _Kty, _Ty> > >
+	class vldunordered_map
+	//: public std::unordered_map<_Kty, _Ty, _Pr, _Alloc>
+	: public std::unordered_map<_Kty, _Ty, Hash, KeyEqual, _Alloc>
+{
+};
+#endif
+struct DelayFreeItem_s
+{
+	//DelayFreeItem_s() {}
+	HANDLE heap;
+	DWORD flags;
+	LPVOID mem;
+	//TBD: capture the freeing callstack...
+	CallStack* stack_at_free; //= CallStack::Create();
+};
+template <typename T>
+class vldvector : public std::vector<T, VLDCustomAlloc<T> >
+{
+};
+const size_t maxDelayFreeItems = 500000; // 250000; // 12000;
+//std::vector<DelayFreeItem_s> x(maxDelayFreeItems);
+static vldvector < DelayFreeItem_s> delayedFrees; // (maxDelayFreeItems);
+static int nextdelayfreeitem = 0;
+vldunordered_map<LPVOID, unsigned, std::hash<LPVOID>> RtlFreeHeapItemsMap;
+static uint64_t cnt_RtlFreeHeapCalls = 0;
+static uint64_t cnt_RtlFreeHeapSkippedLock = 0;
 BYTE VisualLeakDetector::_RtlFreeHeap (HANDLE heap, DWORD flags, LPVOID mem)
 {
+	++cnt_RtlFreeHeapCalls;
     PRINT_HOOKED_FUNCTION2();
     BYTE status;
 
-    if (!g_DbgHelp.IsLockedByCurrentThread()) // skip dbghelp.dll calls
-    {
-        // Record the current frame pointer.
-        CAPTURE_CONTEXT();
-        context_.func = reinterpret_cast<UINT_PTR>(RtlFreeHeap);
+#if 0 //maybe chicken-egg kind of problem init'ing...
+	
+	if(!RtlFreeHeapItemsMap.size()) //capacity())
+		RtlFreeHeapItemsMap.reserve(maxDelayFreeItems);
+	//TBD: thread protection needed?
+	decltype(RtlFreeHeapItemsMap.find(mem)) itFreeItem = RtlFreeHeapItemsMap.end();// = RtlFreeHeapItemsMap.find(mem);
+	if (RtlFreeHeapItemsMap.size())
+		itFreeItem = RtlFreeHeapItemsMap.find(mem);
 
-        // Unmap the block from the specified heap.
-        g_vld.unmapBlock(heap, mem, context_);
+	if (itFreeItem != RtlFreeHeapItemsMap.end())
+	{
+		++itFreeItem->second;
+		char buf[256];
+		sprintf(buf, "multi-free heap %u, addr %p\n", heap, mem);
+		OutputDebugStringA(buf);
+		if (IsDebuggerPresent())
+			__debugbreak();
+	}
+	else
+		//RtlFreeHeapItemsMap[mem] = 1;
+		RtlFreeHeapItemsMap.insert(std::pair<decltype(mem),unsigned>(mem, 1));
+#endif
+#if 0 //delayed freeing or not...
+	if (delayedFrees.size() < maxDelayFreeItems)
+		delayedFrees.reserve(maxDelayFreeItems);
+#if 01 //failures as result of multi-frees, (or is it callstack alloc's on the delay freed items?)
+	if(mem)
+	{
+		decltype(delayedFrees.end()) itFound;
+		if ((itFound = std::find_if(delayedFrees.begin(), delayedFrees.end(), [mem](const DelayFreeItem_s &v)->bool { return v.mem == mem; })) != delayedFrees.end())
+		//if ((itFound = std::find(delayedFrees.begin(), delayedFrees.end(), [mem](const DelayFreeItem_s &v)->bool { return v.mem == mem; })) != delayedFrees.end())
+		{
+			//hmm, have seen *same* address assoc'd with *different* heaps, how so, since *we* didn't actually *free* it yet????
+			Report(L"multi-free addr %p (heap %p), delayed free pending prev addr %p, heap %p, heaps diff %d, prev idx %llu...\n", mem, heap, itFound->mem, itFound->heap, itFound->heap == heap
+				,itFound - delayedFrees.begin());
+			Report(L"Orig Freeing Call stack:\n");
+			itFound->stack_at_free->dump(FALSE);
+			CallStack* stack_here = CallStack::Create();
+			CAPTURE_CONTEXT();
+			context_.func = NULL;
+			stack_here->getStackTrace(g_vld.m_maxTraceFrames, context_);
+			Report(L"Current Freeing Call stack:\n");
+			stack_here->dump(FALSE);
+			ReportFlush();
+			delete stack_here;
+			if (itFound->heap == heap)
+			{
+				char buf[256];
+				sprintf(buf, "multi-free addr %p (heap %p), delayed free pending prev addr %p, heap %p...\n", mem, heap, itFound->mem, itFound->heap);
+				OutputDebugStringA(buf);
+				if (IsDebuggerPresent())
+					__debugbreak();
+			}
+
+		}
+	}
+#endif
+	if (mem)
+	{
+		if (delayedFrees.size() == maxDelayFreeItems)
+		{
+			//TBD: perform mem fill
+			CriticalSectionLocker<> cs(g_heapMapLock);
+			HeapMap::Iterator heapit = g_vld.m_heapMap->find(heap);
+			if (heapit == g_vld.m_heapMap->end()) {
+				// We don't have a block map for this heap. We must not have monitored
+				// this allocation (probably happened before VLD was initialized).
+				//(May also be slight possibility that some one init'd free from one thread, and free'd heap from another
+				//with the free and our unmapping of the heap occurring before reaching here - but assume lib's sync mech's
+				//should prob. prevent that...  maybe thread swapping on exiting of both parts plus other thread swaps
+				//could still have us in that situation - or not...
+				//TBD: do we (optionally?) report this?
+				//ok, at least on startup we get here... __debugbreak();
+				//just count 'em...
+				static uint64_t howmany = 0;
+				++howmany;
+				//return TRUE; //sorry, we just lose this one...
+				//even tho' we don't recognize it, maybe environ will, continue on
+			}
+			else
+			{
+				// Find this block in the block map.
+				BlockMap           *blockmap = &(*heapit).second->blockMap;
+				BlockMap::Iterator  blockit = blockmap->find(mem);
+				const auto freeFillByteVal = '\xfb';
+				if (blockit != blockmap->end())
+				{
+					//Found it, we can fill it...
+					blockinfo_t *info = (*blockit).second;
+					if (++info->freecnt > 1)
+						__debugbreak();
+					memset(mem, freeFillByteVal, info->size);
+
+#if 01
+					CallStack* stack_here = CallStack::Create();
+					CAPTURE_CONTEXT();
+					context_.func = NULL;
+					stack_here->getStackTrace(g_vld.m_maxTraceFrames, context_);
+#endif
+					std::swap(delayedFrees[nextdelayfreeitem].heap, heap);
+					std::swap(delayedFrees[nextdelayfreeitem].flags, flags);
+					std::swap(delayedFrees[nextdelayfreeitem].mem, mem);
+#if 01
+					std::swap(delayedFrees[nextdelayfreeitem].stack_at_free, stack_here);
+					delete stack_here;
+#endif
+					nextdelayfreeitem = (nextdelayfreeitem + 1) % maxDelayFreeItems;
+					//Check filled mem contents for writes
+					/*HeapMap::Iterator*/ heapit = g_vld.m_heapMap->find(heap);
+					if (heapit == g_vld.m_heapMap->end()) {
+						// We don't have a block map for this heap. We must not have monitored
+						// this allocation (probably happened before VLD was initialized).
+						//TBD: do we (optionally?) report this?
+						//is poss. that heap may have been freed
+						//TBD: does lib prevent freeing of heap
+						//if outstanding allocations?  If so, we could mess up legitimate programs, but don't
+						//expect that to be common, we'll just potentially 'leak' this item for which we (now) have
+						//no record of its heap...
+						//return TRUE; //sorry, we just lose this one...
+						//allow to fall thru, and, assuming it's valid block, be  free, even tho' we no (longer?) have record...
+						//of course, if now really bogus, could choke the caller, so be it for now...
+					}
+					else
+					{
+
+						// Find this block in the block map.
+						/*BlockMap           * */ blockmap = &(*heapit).second->blockMap;
+						/*BlockMap::Iterator  */ blockit = blockmap->find(mem);
+						if (blockit != blockmap->end())
+						{
+							//Found it, we can check it...
+							blockinfo_t *info = (*blockit).second;
+							//memset(mem, info->size, '\xfb');
+							char *pbytes = static_cast<char *>(mem);
+							for (auto i = 0; i < info->size; ++i)
+								if (pbytes[i] != freeFillByteVal)
+								{
+									char buf[256];
+									sprintf(buf, "i %d, pbytes[i] %x, mem %p, size %llu\n", i, pbytes[i], mem, info->size);
+									OutputDebugStringA(buf);
+									__debugbreak();
+								}
+						}
+					}
+					//nextdelayfreeitem = (nextdelayfreeitem + 1) % maxDelayFreeItems;
+				}
+			}
+		}
+		else
+		{
+			//TBD: perform mem fill
+			HeapMap::Iterator heapit = g_vld.m_heapMap->find(heap);
+			if (heapit != g_vld.m_heapMap->end()) 
+			{
+				BlockMap           *blockmap = &(*heapit).second->blockMap;
+				BlockMap::Iterator  blockit = blockmap->find(mem);
+				const auto freeFillByteVal = '\xfb';
+				if (blockit != blockmap->end())
+				{
+					//Found it, we can fill it...
+					blockinfo_t *info = (*blockit).second;
+					if (++info->freecnt > 1)
+						__debugbreak();
+					memset(mem, freeFillByteVal, info->size);
+				}
+			}
+			//accum 'til max reached, then other branch will be taken.
+			delayedFrees.emplace_back(DelayFreeItem_s{ heap, flags, mem, nullptr });
+#if 01
+			CallStack* stack_here = CallStack::Create();
+			CAPTURE_CONTEXT();
+			//context_.func = reinterpret_cast<UINT_PTR>(VisualLeakDetector::mapBlock);
+			//context_.func = (UINT_PTR)&VisualLeakDetector::mapBlock;
+			//context_.func = reinterpret_cast<UINT_PTR>(reinterpret_cast<void*>(&VisualLeakDetector::mapBlock));
+			//decltype(&VisualLeakDetector::mapBlock) methptr = &VisualLeakDetector::mapBlock;
+			//void *vmethptr = (void *)methptr;
+			//typedef decltype(VisualLeakDetector::mapBlock) vldmb_t; VisualLeakDetector::mapBlock;
+			//vldmb_t mp = VisualLeakDetector::mapBlock;
+			//context_.func = (void*)mp;
+			context_.func = NULL;
+			stack_here->getStackTrace(g_vld.m_maxTraceFrames, context_);
+			delayedFrees.back().stack_at_free = stack_here;
+#endif
+			//Report(L"CURRENT Call stack.\n");
+			//stack_here->dump(FALSE);
+			// Now it should be safe to delete our temporary callstack
+			//delete stack_here;
+			//stack_here = NULL;
+			//if (delayedFrees.size() == maxDelayFreeItems)
+			//	__debugbreak();
+			return TRUE;
+		}
+	}
+#endif
+
+    if(!(g_vld.refOptions() & VLD_OPT_TRACKING_PAUSED))
+    {
+	    if (!g_DbgHelp.IsLockedByCurrentThread()) // skip dbghelp.dll calls
+	    {
+		    // Record the current frame pointer.
+		    CAPTURE_CONTEXT();
+		    context_.func = reinterpret_cast<UINT_PTR>(RtlFreeHeap);
+
+		    // Unmap the block from the specified heap.
+		    g_vld.unmapBlock(heap, mem, context_);
+	    }
+	    else
+	    {
+		    ++cnt_RtlFreeHeapSkippedLock;
+
+		    //try to unmap address anyway, see if this avoids 'new allocation at already allocated address' path...
+
+		    // Record the current frame pointer.
+		    CAPTURE_CONTEXT();
+		    context_.func = reinterpret_cast<UINT_PTR>(RtlFreeHeap);
+
+		    // Unmap the block from the specified heap.
+		    g_vld.unmapBlock(heap, mem, context_, true);
+
+	    }
     }
 
-    status = RtlFreeHeap(heap, flags, mem);
+#if 0
+	if (RtlFreeHeapItemsMap.size())
+		itFreeItem = RtlFreeHeapItemsMap.find(mem);
+	if (itFreeItem != RtlFreeHeapItemsMap.end())
+		RtlFreeHeapItemsMap.erase(itFreeItem);
+#endif
+
+	static uint64_t HeapZeroCnt = 0, MemZeroCnt = 0;
+	if (!heap) ++HeapZeroCnt;
+	if (!mem) ++MemZeroCnt;
+#if 0
+	if (heap && mem && !HeapValidate(heap, 0, mem))
+	{
+		status = FALSE;
+		__debugbreak();
+	}
+	else if (heap && mem && !HeapValidate(heap, 0, 0))
+	{
+		status = FALSE;
+		__debugbreak();
+	}
+	else
+#endif
+	status = RtlFreeHeap(heap, flags, mem);
 
     return status;
 }
 
 // HeapFree (kernel32.dll) call RtlFreeHeap (ntdll.dll)
+const size_t maxDelayFreeItems2 = 12000;
+//std::vector<DelayFreeItem_s> x(maxDelayFreeItems);
+static vldvector < DelayFreeItem_s> delayedFrees2; // (maxDelayFreeItems);
+static int nextdelayfreeitem2 = 0;
+vldunordered_map<LPVOID, unsigned, std::hash<LPVOID> > FreeHeapItemsMap;
+static uint64_t cnt_HeapFreeCalls = 0;
+static uint64_t cnt_HeapFreeSkippedLock = 0;
 BOOL VisualLeakDetector::_HeapFree (HANDLE heap, DWORD flags, LPVOID mem)
 {
+	++cnt_HeapFreeCalls;
     PRINT_HOOKED_FUNCTION2();
     BOOL status;
 
-    if (!g_DbgHelp.IsLockedByCurrentThread()) // skip dbghelp.dll calls
-    {
-        // Record the current frame pointer.
-        CAPTURE_CONTEXT();
-        context_.func = reinterpret_cast<UINT_PTR>(m_HeapFree);
+	class delayedFrees {};
+	class nextdelayfreeitem {};
+	class maxDelayFreeItems {};
+#if 0
+	//TBD: thread protection needed?
+	if (!FreeHeapItemsMap.size()) //capacity())
+		FreeHeapItemsMap.reserve(maxDelayFreeItems2);
+	//auto itFreeItem = FreeHeapItemsMap.find(mem);
+	decltype(FreeHeapItemsMap.end()) itFreeItem = FreeHeapItemsMap.end();
+	if(FreeHeapItemsMap.size())
+		itFreeItem = FreeHeapItemsMap.find(mem);
+	if (itFreeItem != FreeHeapItemsMap.end())
+	{
+		++itFreeItem->second;
+		char buf[256];
+		sprintf(buf, "multi-free heap %u, addr %p\n", heap, mem);
+		OutputDebugStringA(buf);
+		if (IsDebuggerPresent())
+			__debugbreak();
+	}
+	else
+		//FreeHeapItemsMap[mem] = 1;
+		FreeHeapItemsMap.insert(std::pair<decltype(mem),unsigned>(mem, 1));
+#endif
 
-        // Unmap the block from the specified heap.
-        g_vld.unmapBlock(heap, mem, context_);
+#if 0 //delayed freeing or not...
+	if (delayedFrees2.size() < maxDelayFreeItems2)
+		delayedFrees2.reserve(maxDelayFreeItems2);
+#if 0 //seem to be failing as result of questionable multi-frees (same addr, diff. heaps), do we run if we avoid this?
+	if(mem)
+	{
+		decltype(delayedFrees2.end()) itFound;
+		//if ((itFound = std::find_if(delayedFrees2.begin(), delayedFrees2.end(), mem)) != delayedFrees2.end())
+		if ((itFound = std::find_if(delayedFrees2.begin(), delayedFrees2.end(), [mem](const DelayFreeItem_s &v)->bool { return v.mem == mem; })) != delayedFrees2.end())
+		{
+			Report(L"multi-free addr %p (heap %p), delayed free pending prev addr %p, heap %p, heaps diff %d...\n", mem, heap, itFound->mem, itFound->heap, itFound->heap == heap);
+			Report(L"Orig. Freeing Call stack:\n");
+			itFound->stack_at_free->dump(FALSE);
+			CallStack* stack_here = CallStack::Create();
+			CAPTURE_CONTEXT();
+			context_.func = NULL;
+			stack_here->getStackTrace(g_vld.m_maxTraceFrames, context_);
+			Report(L"Current Freeing Call stack:\n");
+			stack_here->dump(FALSE);
+			ReportFlush();
+			if(itFound->heap == heap)
+			{
+				char buf[256];
+				sprintf(buf, "multi-free addr %p (heap %p), delayed free pending...\n", mem, heap);
+				OutputDebugStringA(buf);
+				if (IsDebuggerPresent())
+					__debugbreak();
+			}
+
+		}
+	}
+#endif
+	if (mem)
+	{
+		if (delayedFrees2.size() == maxDelayFreeItems2)
+		{
+			//TBD: perform mem fill
+			CriticalSectionLocker<> cs(g_heapMapLock);
+			HeapMap::Iterator heapit = g_vld.m_heapMap->find(heap);
+			if (heapit == g_vld.m_heapMap->end()) {
+				// We don't have a block map for this heap. We must not have monitored
+				// this allocation (probably happened before VLD was initialized).
+				//(May also be slight possibility that some one init'd free from one thread, and free'd heap from another
+				//with the free and our unmapping of the heap occurring before reaching here - but assume lib's sync mech's
+				//should prob. prevent that...  maybe thread swapping on exiting of both parts plus other thread swaps
+				//could still have us in that situation - or not...
+				//TBD: do we (optionally?) report this?
+				//ok, at least on startup we get here... __debugbreak();
+				//just count 'em...
+				static uint64_t howmany = 0;
+				++howmany;
+				//return TRUE; //sorry, we just lose this one...
+				//let it fall thru, we may not have it, but could be legit, return to environ if possible
+			}
+			else
+			{
+				// Find this block in the block map.
+				BlockMap           *blockmap = &(*heapit).second->blockMap;
+				BlockMap::Iterator  blockit = blockmap->find(mem);
+				const auto freeFillByteVal = '\xfb';
+				if (blockit != blockmap->end())
+				{
+					//Found it, we can fill it...
+					blockinfo_t *info = (*blockit).second;
+					if (++info->freecnt > 1)
+						__debugbreak();
+					memset(mem, freeFillByteVal, info->size);
+
+					CallStack* stack_here = CallStack::Create();
+					CAPTURE_CONTEXT();
+					context_.func = NULL;
+					stack_here->getStackTrace(g_vld.m_maxTraceFrames, context_);
+
+					std::swap(delayedFrees2[nextdelayfreeitem2].heap, heap);
+					std::swap(delayedFrees2[nextdelayfreeitem2].flags, flags);
+					std::swap(delayedFrees2[nextdelayfreeitem2].mem, mem);
+					std::swap(delayedFrees2[nextdelayfreeitem2].stack_at_free, stack_here);
+					delete stack_here;
+					nextdelayfreeitem2 = ++nextdelayfreeitem2 % maxDelayFreeItems2;
+					//Check filled mem contents for writes
+					/*HeapMap::Iterator*/ heapit = g_vld.m_heapMap->find(heap);
+					if (heapit == g_vld.m_heapMap->end()) {
+						// We don't have a block map for this heap. We must not have monitored
+						// this allocation (probably happened before VLD was initialized).
+						//TBD: do we (optionally?) report this?
+						//is poss. that heap may have been freed
+						//TBD: does lib prevent freeing of heap
+						//if outstanding allocations?  If so, we could mess up legitimate programs, but don't
+						//expect that to be common, we'll just potentially 'leak' this item for which we (now) have
+						//no record of its heap...
+						//return TRUE; //sorry, we just lose this one...
+						//allow to fall thru, and, assuming it's valid block, be  free, even tho' we no (longer?) have record...
+						//of course, if now really bogus, could choke the caller, so be it for now...
+					}
+					else
+					{
+
+						// Find this block in the block map.
+						/*BlockMap           * */ blockmap = &(*heapit).second->blockMap;
+						/*BlockMap::Iterator  */ blockit = blockmap->find(mem);
+						if (blockit != blockmap->end())
+						{
+							//Found it, we can check it...
+							blockinfo_t *info = (*blockit).second;
+							//memset(mem, info->size, '\xfb');
+							char *pbytes = static_cast<char *>(mem);
+							for (auto i = 0; i < info->size; ++i)
+								if (pbytes[i] != freeFillByteVal)
+								{
+									char buf[256];
+									sprintf(buf, "i %d, pbytes[i] %x, mem %p, size %llu\n", i, pbytes[i], mem, info->size);
+									OutputDebugStringA(buf);
+									__debugbreak();
+								}
+						}
+					}
+					//nextdelayfreeitem2 = ++nextdelayfreeitem2 % maxDelayFreeItems2;
+				}
+
+			}
+		}
+		else
+		{
+			//TBD: perform mem fill
+			HeapMap::Iterator heapit = g_vld.m_heapMap->find(heap);
+			if (heapit != g_vld.m_heapMap->end())
+			{
+				BlockMap           *blockmap = &(*heapit).second->blockMap;
+				BlockMap::Iterator  blockit = blockmap->find(mem);
+				const auto freeFillByteVal = '\xfb';
+				if (blockit != blockmap->end())
+				{
+					//Found it, we can fill it...
+					blockinfo_t *info = (*blockit).second;
+					if (++info->freecnt > 1)
+						__debugbreak();
+					memset(mem, freeFillByteVal, info->size);
+				}
+			}
+			//accum 'til max reached, then other branch will be taken.
+			delayedFrees2.emplace_back(DelayFreeItem_s{ heap, flags, mem });
+			CallStack* stack_here = CallStack::Create();
+			CAPTURE_CONTEXT();
+			//context_.func = reinterpret_cast<UINT_PTR>(VisualLeakDetector::mapBlock);
+			//context_.func = (UINT_PTR)&VisualLeakDetector::mapBlock;
+			//context_.func = reinterpret_cast<UINT_PTR>(reinterpret_cast<void*>(&VisualLeakDetector::mapBlock));
+			//decltype(&VisualLeakDetector::mapBlock) methptr = &VisualLeakDetector::mapBlock;
+			//void *vmethptr = (void *)methptr;
+			//typedef decltype(VisualLeakDetector::mapBlock) vldmb_t; VisualLeakDetector::mapBlock;
+			//vldmb_t mp = VisualLeakDetector::mapBlock;
+			//context_.func = (void*)mp;
+			context_.func = NULL;
+			stack_here->getStackTrace(g_vld.m_maxTraceFrames, context_);
+			delayedFrees2.back().stack_at_free = stack_here;
+			//Report(L"CURRENT Call stack.\n");
+			//stack_here->dump(FALSE);
+			// Now it should be safe to delete our temporary callstack
+			//delete stack_here;
+			//stack_here = NULL;
+			return TRUE;
+		}
+	}
+#endif
+
+    if (!(g_vld.refOptions() & VLD_OPT_TRACKING_PAUSED) )
+    {
+        if (!g_DbgHelp.IsLockedByCurrentThread()) // skip dbghelp.dll calls
+	    {
+		    // Record the current frame pointer.
+		    CAPTURE_CONTEXT();
+		    context_.func = reinterpret_cast<UINT_PTR>(m_HeapFree);
+
+		    // Unmap the block from the specified heap.
+		    g_vld.unmapBlock(heap, mem, context_);
+	    }
+	    else
+	    {
+		    ++cnt_HeapFreeSkippedLock;
+		    CAPTURE_CONTEXT();
+		    context_.func = reinterpret_cast<UINT_PTR>(m_HeapFree);
+
+		    // Unmap the block from the specified heap.
+		    g_vld.unmapBlock(heap, mem, context_, true);
+	    }
     }
 
-    status = m_HeapFree(heap, flags, mem);
+#if 0
+	if (FreeHeapItemsMap.size())
+		itFreeItem = FreeHeapItemsMap.find(mem);
+	if (itFreeItem != FreeHeapItemsMap.end())
+		FreeHeapItemsMap.erase(itFreeItem);
+#endif
+
+	static uint64_t HeapZeroCnt = 0, MemZeroCnt = 0;
+	if (!heap) ++HeapZeroCnt;
+	if (!mem) ++MemZeroCnt;
+#if 0
+	if (heap && mem && !HeapValidate(heap, 0, mem))
+	{
+		status = FALSE;
+		__debugbreak();
+	}
+	else if (heap && mem && !HeapValidate(heap, 0, 0))
+	{
+		status = FALSE;
+		__debugbreak();
+	}
+	else
+#endif
+	status = m_HeapFree(heap, flags, mem);
 
     return status;
 }
@@ -261,39 +786,51 @@ BOOL VisualLeakDetector::_HeapFree (HANDLE heap, DWORD flags, LPVOID mem)
 //
 //    Returns the value returned by RtlReAllocateHeap.
 //
+static uint64_t cnt_RtlReAllocHeapCalls = 0;
+static uint64_t cnt_RtlReAllocHeapSkippedLock = 0;
 LPVOID VisualLeakDetector::_RtlReAllocateHeap (HANDLE heap, DWORD flags, LPVOID mem, SIZE_T size)
 {
+	++cnt_RtlReAllocHeapCalls;
     PRINT_HOOKED_FUNCTION();
 
     // Reallocate the block.
     LPVOID newmem = RtlReAllocateHeap(heap, flags, mem, size);
+    if (g_vld.refOptions() & VLD_OPT_TRACKING_PAUSED) return newmem;
     if ((newmem == NULL) || !g_vld.enabled())
         return newmem;
 
-    if (!g_DbgHelp.IsLockedByCurrentThread()) { // skip dbghelp.dll calls
-        CAPTURE_CONTEXT();
-        CaptureContext cc(RtlReAllocateHeap, context_);
-        cc.Set(heap, mem, newmem, size);
-    }
+	if (!g_DbgHelp.IsLockedByCurrentThread()) { // skip dbghelp.dll calls
+		CAPTURE_CONTEXT();
+		CaptureContext cc(RtlReAllocateHeap, context_);
+		cc.Set(heap, mem, newmem, size);
+	}
+	else
+		++cnt_RtlReAllocHeapSkippedLock;
 
     return newmem;
 }
 
 // for kernel32.dll
+static uint64_t cnt_HeapReAllocCalls = 0;
+static uint64_t cnt_HeapReAllocSkippedLock = 0;
 LPVOID VisualLeakDetector::_HeapReAlloc (HANDLE heap, DWORD flags, LPVOID mem, SIZE_T size)
 {
+	++cnt_HeapReAllocCalls;
     PRINT_HOOKED_FUNCTION();
 
     // Reallocate the block.
     LPVOID newmem = HeapReAlloc(heap, flags, mem, size);
+    if (g_vld.refOptions() & VLD_OPT_TRACKING_PAUSED) return newmem;
     if ((newmem == NULL) || !g_vld.enabled())
         return newmem;
 
-    if (!g_DbgHelp.IsLockedByCurrentThread()) { // skip dbghelp.dll calls
-        CAPTURE_CONTEXT();
-        CaptureContext cc(HeapReAlloc, context_);
-        cc.Set(heap, mem, newmem, size);
-    }
+	if (!g_DbgHelp.IsLockedByCurrentThread()) { // skip dbghelp.dll calls
+		CAPTURE_CONTEXT();
+		CaptureContext cc(HeapReAlloc, context_);
+		cc.Set(heap, mem, newmem, size);
+	}
+	else
+		++cnt_HeapReAllocSkippedLock;
 
     return newmem;
 }
@@ -320,8 +857,10 @@ LPVOID VisualLeakDetector::_HeapReAlloc (HANDLE heap, DWORD flags, LPVOID mem, S
 //
 //    Always returns S_OK.
 //
+static uint64_t cnt_CoGetMallocCalls = 0;
 HRESULT VisualLeakDetector::_CoGetMalloc (DWORD context, LPMALLOC *imalloc)
 {
+	++cnt_CoGetMallocCalls;
     PRINT_HOOKED_FUNCTION();
     static CoGetMalloc_t pCoGetMalloc = NULL;
 
@@ -374,8 +913,10 @@ HRESULT VisualLeakDetector::_CoGetMalloc (DWORD context, LPMALLOC *imalloc)
 //
 //    Returns the value returned from CoTaskMemAlloc.
 //
+static uint64_t cnt_CoTaskMemAllocCalls = 0;
 LPVOID VisualLeakDetector::_CoTaskMemAlloc (SIZE_T size)
 {
+	++cnt_CoTaskMemAllocCalls;
     PRINT_HOOKED_FUNCTION();
     static CoTaskMemAlloc_t pCoTaskMemAlloc = NULL;
 
@@ -406,8 +947,10 @@ LPVOID VisualLeakDetector::_CoTaskMemAlloc (SIZE_T size)
 //
 //    Returns the value returned from CoTaskMemRealloc.
 //
+static uint64_t cnt_CoTaskMemReallocCalls = 0;
 LPVOID VisualLeakDetector::_CoTaskMemRealloc (LPVOID mem, SIZE_T size)
 {
+	++cnt_CoTaskMemReallocCalls;
     PRINT_HOOKED_FUNCTION();
     static CoTaskMemRealloc_t pCoTaskMemRealloc = NULL;
 
@@ -608,4 +1151,29 @@ ULONG VisualLeakDetector::Release ()
         FreeLibrary(m_vldBase);
     }
     return nCount;
+}
+
+void ReportHookCallCounts()
+{
+//static uint64_t cnt_HeapAllocCalls = 0;
+//static uint64_t cnt_RtlFreeHeapCalls = 0;
+//static uint64_t cnt_HeapFreeCalls = 0;
+//static uint64_t cnt_RtlReAllocHeapCalls = 0;
+//static uint64_t cnt_HeapReAllocCalls = 0;
+//static uint64_t cnt_CoGetMallocCalls = 0;
+//static uint64_t cnt_CoTaskMemAllocCalls = 0;
+//static uint64_t cnt_CoTaskMemReallocCalls = 0;
+	Report(L"Hook call counts:\n");
+	Report(L"\t cnt_RtlAllocateCalls %llu, SkipLock %llu\n", cnt_RtlAllocateHeapCalls, cnt_RtlAllocateHeapSkippedLock);
+	Report(L"\t cnt_HeapAllocCalls %llu, SkipLock %llu\n", cnt_HeapAllocCalls, cnt_HeapAllocSkippedLock);
+	Report(L"\t cnt_RtlFreeHeapCalls %llu, SkipLock %llu\n", cnt_RtlFreeHeapCalls, cnt_RtlFreeHeapSkippedLock);
+	Report(L"\t cnt_HeapFreeCalls %llu, SkipLock %llu\n", cnt_HeapFreeCalls, cnt_HeapFreeSkippedLock);
+	Report(L"\t cnt_RtlReAllocHeapCalls %llu, SkipLock %llu\n", cnt_RtlReAllocHeapCalls, cnt_RtlReAllocHeapSkippedLock);
+	Report(L"\t cnt_HeapReAllocCalls %llu, SkipLock %llu\n", cnt_HeapReAllocCalls, cnt_HeapReAllocSkippedLock);
+	Report(L"\t cnt_HeapCreateCalls %llu\n", cnt_HeapCreateCalls);
+	Report(L"\t cnt_HeapDestroyCalls %llu\n", cnt_HeapDestroyCalls);
+	Report(L"\t cnt_CoGetMallocCalls %llu\n", cnt_CoGetMallocCalls);
+	Report(L"\t cnt_CoTaskMemAllocCalls %llu\n", cnt_CoTaskMemAllocCalls);
+	Report(L"\t cnt_CoTaskMemReallocCalls %llu\n", cnt_CoTaskMemReallocCalls);
+    Report(L"vld internal Heap Handle %p (so can visually filter from windbg !heap -p -all or !heap 0 -a)\n",g_vldHeap);
 }

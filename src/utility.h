@@ -133,7 +133,9 @@ VOID InsertReportDelay ();
 BOOL IsModulePatched (HMODULE importmodule, moduleentry_t patchtable [], UINT tablesize);
 BOOL PatchImport (HMODULE importmodule, moduleentry_t *module);
 BOOL PatchModule (HMODULE importmodule, moduleentry_t patchtable [], UINT tablesize);
-VOID Print (LPWSTR message);
+VOID PrintFlush();
+VOID Print (LPWSTR message, unsigned nchars);
+VOID ReportFlush();
 VOID Report (LPCWSTR format, ...);
 #ifndef NDEBUG
 #define DbgPrint(x)     Print(x)
