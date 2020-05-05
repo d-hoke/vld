@@ -22,6 +22,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 
 #include "stdafx.h"
+#include <time.h>
 
 #define VLDBUILD     // Declares that we are building Visual Leak Detector.
 #include "vldint.h"  // Provides access to the Visual Leak Detector internals.
@@ -169,7 +170,11 @@ __declspec(dllexport) UINT VLDBumpReportCheckPoint(CONST WCHAR *blurb)
 {
     VLDReportStats();
     decltype(VLDBumpCheckPoint()) ckpt = VLDBumpCheckPoint();
-    Report(L"next checkpointval %u, seqno %llu, %s\n", ckpt, VLDNextAllocSeqNum(), blurb);
+    time_t t;
+    time(&t);
+
+    Report(L"next checkpointval %u, seqno %llu, %s @ %S", ckpt, VLDNextAllocSeqNum(), blurb, asctime(localtime(&t)));
+    PrintFlush();
 
     return ckpt;
 }
@@ -177,7 +182,10 @@ __declspec(dllexport) UINT VLDBumpReportCheckPointA(CONST char *ablurb)
 {
     VLDReportStats();
     decltype(VLDBumpCheckPoint()) ckpt = VLDBumpCheckPoint();
-    Report(L"next checkpointval %u, seqno %llu, %S\n", ckpt, VLDNextAllocSeqNum(), ablurb);
+    time_t t;
+    time(&t);
+    Report(L"next checkpointval %u, seqno %llu, %S @%S", ckpt, VLDNextAllocSeqNum(), ablurb, asctime(localtime(&t)));
+    PrintFlush();
 
     return ckpt;
 }

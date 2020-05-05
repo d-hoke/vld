@@ -163,7 +163,29 @@ LPVOID VisualLeakDetector::_RtlAllocateHeap (HANDLE heap, DWORD flags, SIZE_T si
 	++cnt_RtlAllocateHeapCalls;
     PRINT_HOOKED_FUNCTION2();
     // Allocate the block.
+//alternate path for CACHING 
+#if 01
     LPVOID block = RtlAllocateHeap(heap, flags, size);
+#elif 0
+    HeapMap::Iterator heapit = g_vld.findOrMapBlock(heap);
+    //assert(heapit != ?);
+    //SIZE_T paddedsz = heapit->second.cache.paddedsz(size);
+    //LPVOID block = heapit->second.cache.obtain(paddedsz);
+    MultsOfHeapBucketCacher::reqinfo ri;
+    ri.reqsz = size;
+    LPVOID block = (*heapit).second->cache.obtain(ri);
+    if (!block)
+    {
+        //none cached, alloc another
+        block = RtlAllocateHeap(heap, flags, ri.adjmultsz);
+        //update bookkeeping
+        (*heapit).second->cache.updateOverhead((MultsOfHeapBucketCacher::overhead *)block, ri);
+        (*heapit).second->cache.incrAllocCount(ri);
+
+        //(char *)block += paddedsz - size;
+        block = (*heapit).second->cache.adj2userdata(block);
+    }
+#endif
 
     if ((g_vld.refOptions() & VLD_OPT_TRACKING_PAUSED))
         return block;
@@ -180,15 +202,57 @@ LPVOID VisualLeakDetector::_RtlAllocateHeap (HANDLE heap, DWORD flags, SIZE_T si
     return block;
 }
 
+extern HeapMap::Iterator findOrMapBlock(HANDLE heap);
 static uint64_t cnt_HeapAllocCalls = 0;
 static uint64_t cnt_HeapAllocSkippedLock = 0;
 // HeapAlloc (kernel32.dll) call RtlAllocateHeap (ntdll.dll)
 LPVOID VisualLeakDetector::_HeapAlloc (HANDLE heap, DWORD flags, SIZE_T size)
 {
 	++cnt_HeapAllocCalls;
-    PRINT_HOOKED_FUNCTION2();
+	//TBD: fragmentation exploration
+	//SIZE_T minsize = 512;
+	//if (size < minsize) size = minsize; //searching for possible fragmentation avoidance... (even against 'low-fragmentation' heap)
+	PRINT_HOOKED_FUNCTION2();
+    //alternate path for CACHING 
+#if 01
+    //original vld default path
     // Allocate the block.
     LPVOID block = HeapAlloc(heap, flags, size);
+#elif 0
+	SIZE_T multsz = 64;
+	SIZE_T rem = size % multsz;
+	SIZE_T allocmult = (size / multsz);
+    if (rem) allocmult += 1;
+	SIZE_T allocsz = allocmult * multsz;
+	if (allocsz >= 0x12cc80 && allocsz <= 0x12fe00)
+	{
+		static int skipbreaks = 1;
+		if(!skipbreaks)
+		{
+			__debugbreak();
+		}
+	}
+	LPVOID block = HeapAlloc(heap, flags, allocsz);
+#elif 0 //needs machine caching section in matching free routine
+	HeapMap::Iterator heapit = g_vld.findOrMapBlock(heap);
+	//assert(heapit != ?);
+	//SIZE_T paddedsz = heapit->second.cache.paddedsz(size);
+	//LPVOID block = heapit->second.cache.obtain(paddedsz);
+    MultsOfHeapBucketCacher::reqinfo ri;
+    ri.reqsz = size;
+    LPVOID block = (*heapit).second->cache.obtain(ri);
+    if (!block)
+	{
+		//none cached, alloc another
+        block = HeapAlloc(heap, flags, ri.adjmultsz);
+        //update bookkeeping
+        (*heapit).second->cache.updateOverhead((MultsOfHeapBucketCacher::overhead *)block, ri);
+        (*heapit).second->cache.incrAllocCount(ri);
+
+		//(char *)block += paddedsz - size;
+        block = (*heapit).second->cache.adj2userdata(block);
+	}
+#endif
 
     if ((g_vld.refOptions() & VLD_OPT_TRACKING_PAUSED))
         return block;
@@ -250,7 +314,7 @@ template <typename T>
 class vldvector : public std::vector<T, VLDCustomAlloc<T> >
 {
 };
-const size_t maxDelayFreeItems = 500000; // 250000; // 12000;
+const size_t maxDelayFreeItems = 12000; // 500000; // 250000; // 12000;
 //std::vector<DelayFreeItem_s> x(maxDelayFreeItems);
 static vldvector < DelayFreeItem_s> delayedFrees; // (maxDelayFreeItems);
 static int nextdelayfreeitem = 0;
@@ -263,6 +327,32 @@ BYTE VisualLeakDetector::_RtlFreeHeap (HANDLE heap, DWORD flags, LPVOID mem)
     PRINT_HOOKED_FUNCTION2();
     BYTE status;
 
+    CriticalSectionLocker<> cs(g_heapMapLock);
+#if 0
+    static unsigned long entryCount = 0;
+    InterlockedIncrement(&entryCount);
+
+    static CRITICAL_SECTION critsect;
+    static bool inited = false;
+    if (!inited)
+    {
+        InitializeCriticalSection(&critsect);
+        inited = true;
+    }
+    struct onExit_c {
+        //onExit_c() {
+        ~onExit_c() {
+            InterlockedDecrement(&entryCount);
+            LeaveCriticalSection(&critsect);
+        }
+    } onExit;
+    EnterCriticalSection(&critsect); //TBD: don't remember, does this hang within on thread, or not? Either way, prob. still have problem...
+    if (entryCount > 1)
+    {
+        //Could be we corrupting delayedFrees() underneath ourself? (so to speak...)
+        //__debugbreak();
+    }
+#endif
 #if 0 //maybe chicken-egg kind of problem init'ing...
 	
 	if(!RtlFreeHeapItemsMap.size()) //capacity())
@@ -285,18 +375,21 @@ BYTE VisualLeakDetector::_RtlFreeHeap (HANDLE heap, DWORD flags, LPVOID mem)
 		//RtlFreeHeapItemsMap[mem] = 1;
 		RtlFreeHeapItemsMap.insert(std::pair<decltype(mem),unsigned>(mem, 1));
 #endif
-#if 0 //delayed freeing or not...
+#if 0 //VLDDELAYEDFREES //delayed freeing or not...
 	if (delayedFrees.size() < maxDelayFreeItems)
 		delayedFrees.reserve(maxDelayFreeItems);
 #if 01 //failures as result of multi-frees, (or is it callstack alloc's on the delay freed items?)
 	if(mem)
 	{
 		decltype(delayedFrees.end()) itFound;
-		if ((itFound = std::find_if(delayedFrees.begin(), delayedFrees.end(), [mem](const DelayFreeItem_s &v)->bool { return v.mem == mem; })) != delayedFrees.end())
-		//if ((itFound = std::find(delayedFrees.begin(), delayedFrees.end(), [mem](const DelayFreeItem_s &v)->bool { return v.mem == mem; })) != delayedFrees.end())
+        auto wasEnd = delayedFrees.end();
+		//if ((itFound = std::find_if(delayedFrees.begin(), delayedFrees.end(), [mem](const DelayFreeItem_s &v)->bool { return v.mem == mem; })) != delayedFrees.end())
+        if ((itFound = std::find_if(delayedFrees.begin(), delayedFrees.end(), [mem](const DelayFreeItem_s &v)->bool { return v.mem == mem; })) != wasEnd)
+        //if ((itFound = std::find(delayedFrees.begin(), delayedFrees.end(), [mem](const DelayFreeItem_s &v)->bool { return v.mem == mem; })) != delayedFrees.end())
 		{
+            auto foundatidx = itFound - delayedFrees.begin();
 			//hmm, have seen *same* address assoc'd with *different* heaps, how so, since *we* didn't actually *free* it yet????
-			Report(L"multi-free addr %p (heap %p), delayed free pending prev addr %p, heap %p, heaps diff %d, prev idx %llu...\n", mem, heap, itFound->mem, itFound->heap, itFound->heap == heap
+			Report(L"multi-free addr %p (heap %p), delayed free pending prev addr %p, heap %p, heaps diff %d, prev idx %llu...\n", mem, heap, itFound->mem, itFound->heap, itFound->heap != heap
 				,itFound - delayedFrees.begin());
 			Report(L"Orig Freeing Call stack:\n");
 			itFound->stack_at_free->dump(FALSE);
@@ -311,8 +404,10 @@ BYTE VisualLeakDetector::_RtlFreeHeap (HANDLE heap, DWORD flags, LPVOID mem)
 			if (itFound->heap == heap)
 			{
 				char buf[256];
-				sprintf(buf, "multi-free addr %p (heap %p), delayed free pending prev addr %p, heap %p...\n", mem, heap, itFound->mem, itFound->heap);
-				OutputDebugStringA(buf);
+				//sprintf(buf, "multi-free addr %p (heap %p), delayed free pending prev addr %p, heap %p...\n", mem, heap, itFound->mem, itFound->heap);
+                sprintf(buf, "multi-free addr %p (heap %p), delayed free pending prev addr %p, heap %p, heaps diff %d, prev idx %llu...\n", mem, heap, itFound->mem, itFound->heap, itFound->heap != heap
+                    , itFound - delayedFrees.begin());
+                OutputDebugStringA(buf);
 				if (IsDebuggerPresent())
 					__debugbreak();
 			}
@@ -346,8 +441,9 @@ BYTE VisualLeakDetector::_RtlFreeHeap (HANDLE heap, DWORD flags, LPVOID mem)
 			{
 				// Find this block in the block map.
 				BlockMap           *blockmap = &(*heapit).second->blockMap;
-				BlockMap::Iterator  blockit = blockmap->find(mem);
-				const auto freeFillByteVal = '\xfb';
+				//BlockMap::Iterator  blockit = blockmap->find(mem);
+                BlockMap::iterator  blockit = blockmap->find(mem);
+                const auto freeFillByteVal = '\xfb';
 				if (blockit != blockmap->end())
 				{
 					//Found it, we can fill it...
@@ -418,7 +514,7 @@ BYTE VisualLeakDetector::_RtlFreeHeap (HANDLE heap, DWORD flags, LPVOID mem)
 			if (heapit != g_vld.m_heapMap->end()) 
 			{
 				BlockMap           *blockmap = &(*heapit).second->blockMap;
-				BlockMap::Iterator  blockit = blockmap->find(mem);
+				BlockMap::iterator  blockit = blockmap->find(mem);
 				const auto freeFillByteVal = '\xfb';
 				if (blockit != blockmap->end())
 				{
@@ -430,8 +526,9 @@ BYTE VisualLeakDetector::_RtlFreeHeap (HANDLE heap, DWORD flags, LPVOID mem)
 				}
 			}
 			//accum 'til max reached, then other branch will be taken.
+#if 0
 			delayedFrees.emplace_back(DelayFreeItem_s{ heap, flags, mem, nullptr });
-#if 01
+#else //#if 01
 			CallStack* stack_here = CallStack::Create();
 			CAPTURE_CONTEXT();
 			//context_.func = reinterpret_cast<UINT_PTR>(VisualLeakDetector::mapBlock);
@@ -444,7 +541,8 @@ BYTE VisualLeakDetector::_RtlFreeHeap (HANDLE heap, DWORD flags, LPVOID mem)
 			//context_.func = (void*)mp;
 			context_.func = NULL;
 			stack_here->getStackTrace(g_vld.m_maxTraceFrames, context_);
-			delayedFrees.back().stack_at_free = stack_here;
+			//delayedFrees.back().stack_at_free = stack_here;
+            delayedFrees.emplace_back(DelayFreeItem_s{ heap, flags, mem, stack_here });
 #endif
 			//Report(L"CURRENT Call stack.\n");
 			//stack_here->dump(FALSE);
@@ -508,7 +606,21 @@ BYTE VisualLeakDetector::_RtlFreeHeap (HANDLE heap, DWORD flags, LPVOID mem)
 	}
 	else
 #endif
+
+//alternate path for CACHING 
+#if 01
 	status = RtlFreeHeap(heap, flags, mem);
+#elif 0
+    if (mem)
+    {
+    //needs matching section in _RtlHeapAlloc() or whatever it's called...
+    HeapMap::Iterator heapit = g_vld.findOrMapBlock(heap);
+    //assert(heapit != ?);
+    (*heapit).second->cache.release(mem);
+    //HeapMap::Iterator heapit = g_vld.findOrMapBlock(heap);
+    //heapit->second.cache.release(mem);
+    }
+#endif
 
     return status;
 }
@@ -610,7 +722,7 @@ BOOL VisualLeakDetector::_HeapFree (HANDLE heap, DWORD flags, LPVOID mem)
 			{
 				// Find this block in the block map.
 				BlockMap           *blockmap = &(*heapit).second->blockMap;
-				BlockMap::Iterator  blockit = blockmap->find(mem);
+				BlockMap::iterator  blockit = blockmap->find(mem);
 				const auto freeFillByteVal = '\xfb';
 				if (blockit != blockmap->end())
 				{
@@ -680,7 +792,7 @@ BOOL VisualLeakDetector::_HeapFree (HANDLE heap, DWORD flags, LPVOID mem)
 			if (heapit != g_vld.m_heapMap->end())
 			{
 				BlockMap           *blockmap = &(*heapit).second->blockMap;
-				BlockMap::Iterator  blockit = blockmap->find(mem);
+				BlockMap::iterator  blockit = blockmap->find(mem);
 				const auto freeFillByteVal = '\xfb';
 				if (blockit != blockmap->end())
 				{
@@ -761,10 +873,23 @@ BOOL VisualLeakDetector::_HeapFree (HANDLE heap, DWORD flags, LPVOID mem)
 	}
 	else
 #endif
+
+//alternate path for CACHING 
+#if 01
 	status = m_HeapFree(heap, flags, mem);
+#elif 0
+    if(mem)
+    {
+    HeapMap::Iterator heapit = g_vld.findOrMapBlock(heap);
+    //assert(heapit != ?);
+    (*heapit).second->cache.release(mem);
+    //HeapMap::Iterator heapit = g_vld.findOrMapBlock(heap);
+	//heapit->second.cache.release(mem);
+    }
+#endif
 
     return status;
-}
+}//_HeapFree()
 
 // _RtlReAllocateHeap - Calls to RtlReAllocateHeap are patched through to this
 //   function. This function invokes the real RtlReAllocateHeap and then calls
@@ -792,10 +917,49 @@ LPVOID VisualLeakDetector::_RtlReAllocateHeap (HANDLE heap, DWORD flags, LPVOID 
 {
 	++cnt_RtlReAllocHeapCalls;
     PRINT_HOOKED_FUNCTION();
-
+//TBD: with caching need to identify if mem prev. allocd or new alloc (0), and adjust ptr accordingly, retaining
+//overhead block to place in re-allocated block (if any), and new addr re-adjusted on way out...
     // Reallocate the block.
+//alternate path for CACHING 
+#if 01
     LPVOID newmem = RtlReAllocateHeap(heap, flags, mem, size);
-    if (g_vld.refOptions() & VLD_OPT_TRACKING_PAUSED) return newmem;
+#elif 0
+    SIZE_T origblkreqsz;
+    LPVOID newmem = nullptr;
+    if (mem)
+    {
+        HeapMap::Iterator heapit = g_vld.findOrMapBlock(heap);
+        //assert(heapit != ?);
+        //SIZE_T paddedsz = heapit->second.cache.paddedsz(size);
+        //LPVOID block = heapit->second.cache.obtain(paddedsz);
+        MultsOfHeapBucketCacher::overhead *povrh = (MultsOfHeapBucketCacher::overhead *)(*heapit).second->cache.adj2blkstart(mem);
+        //well not really original, but padded sz we ultimately obtained!!!
+        origblkreqsz = povrh->nmults*povrh->multofval - ((char*)mem - (char*)povrh);
+        //delay until after we copy data!!!... (*heapit).second->cache.release(mem);
+        MultsOfHeapBucketCacher::reqinfo ri;
+        ri.reqsz = size; //the desired new size
+        newmem = (*heapit).second->cache.obtain(ri);
+        if (!newmem)
+        {
+            //TBD: Does HeapReAlloc() accept 0 to indicate a 'new' allocation???
+            //Or do we need to call HeapAlloc() instead... ? 
+            newmem = RtlReAllocateHeap(heap, flags, 0, size);
+            if (newmem)
+            {
+                (*heapit).second->cache.updateOverhead((MultsOfHeapBucketCacher::overhead *)newmem, ri);
+                (*heapit).second->cache.incrAllocCount(ri);
+                memcpy((*heapit).second->cache.adj2userdata(newmem), mem, origblkreqsz);
+            }
+        }
+        if (newmem)
+        {
+            (*heapit).second->cache.release(mem);
+            newmem = (*heapit).second->cache.adj2userdata(newmem);
+        }
+        //else re-alloc failed, return null, orig. mem still there (TBD: Is that correct API behaviour?)
+    }
+#endif
+if (g_vld.refOptions() & VLD_OPT_TRACKING_PAUSED) return newmem;
     if ((newmem == NULL) || !g_vld.enabled())
         return newmem;
 
@@ -817,9 +981,47 @@ LPVOID VisualLeakDetector::_HeapReAlloc (HANDLE heap, DWORD flags, LPVOID mem, S
 {
 	++cnt_HeapReAllocCalls;
     PRINT_HOOKED_FUNCTION();
-
+//alternate path for CACHING 
+#if 01
     // Reallocate the block.
     LPVOID newmem = HeapReAlloc(heap, flags, mem, size);
+#elif 01
+    SIZE_T origblkreqsz;
+    LPVOID newmem = nullptr;
+    if (mem)
+    {
+        HeapMap::Iterator heapit = g_vld.findOrMapBlock(heap);
+        //assert(heapit != ?);
+        //SIZE_T paddedsz = heapit->second.cache.paddedsz(size);
+        //LPVOID block = heapit->second.cache.obtain(paddedsz);
+        MultsOfHeapBucketCacher::overhead *povrh = (MultsOfHeapBucketCacher::overhead *)(*heapit).second->cache.adj2blkstart(mem);
+        //well not really original, but sz we padded to ask for!!!
+        origblkreqsz = povrh->nmults*povrh->multofval - ((char*)mem - (char*)povrh);
+        //delay until after we copy data!!!... (*heapit).second->cache.release(mem);
+        MultsOfHeapBucketCacher::reqinfo ri;
+        ri.reqsz = size; //the desired new size
+        newmem = (*heapit).second->cache.obtain(ri);
+        if (!newmem)
+        {
+            //TBD: Does HeapReAlloc() accept 0 to indicate a 'new' allocation???
+            //Or do we need to call HeapAlloc() instead... ? 
+            newmem = HeapReAlloc(heap, flags, 0, size);
+            if (newmem)
+            {
+                (*heapit).second->cache.updateOverhead((MultsOfHeapBucketCacher::overhead *)newmem,ri);
+                (*heapit).second->cache.incrAllocCount(ri);
+                memcpy((*heapit).second->cache.adj2userdata(newmem), mem, origblkreqsz);
+            }
+        }
+        if (newmem)
+        {
+            (*heapit).second->cache.release(mem);
+            newmem = (*heapit).second->cache.adj2userdata(newmem);
+        }
+        //else re-alloc failed, return null, orig. mem still there (TBD: Is that correct API behaviour?)
+    }
+#endif
+
     if (g_vld.refOptions() & VLD_OPT_TRACKING_PAUSED) return newmem;
     if ((newmem == NULL) || !g_vld.enabled())
         return newmem;
@@ -963,6 +1165,9 @@ LPVOID VisualLeakDetector::_CoTaskMemRealloc (LPVOID mem, SIZE_T size)
 
     CAPTURE_CONTEXT();
     CaptureContext cc((void*)pCoTaskMemRealloc, context_);
+
+//TBD: with caching need to identify if mem prev. allocd or new alloc (0), and adjust ptr accordingly, retaining
+//overhead block to place in re-allocated block (if any), and new addr re-adjusted on way out...
 
     // Do the allocation. The block will be mapped by _RtlReAllocateHeap.
     return pCoTaskMemRealloc(mem, size);
@@ -1126,6 +1331,9 @@ LPVOID VisualLeakDetector::Realloc (_In_opt_ LPVOID mem, _In_ SIZE_T size)
     CAPTURE_CONTEXT();
     CaptureContext cc((void*)iMallocRealloc, context_);
 
+//TBD: with caching need to identify if mem prev. allocd or new alloc (0), and adjust ptr accordingly, retaining
+//overhead block to place in re-allocated block (if any), and new addr re-adjusted on way out...
+
     // Do the allocation. The block will be mapped by _RtlReAllocateHeap.
     assert(m_iMalloc != NULL);
     return (m_iMalloc) ? m_iMalloc->Realloc(mem, size) : NULL;
@@ -1163,7 +1371,7 @@ void ReportHookCallCounts()
 //static uint64_t cnt_CoGetMallocCalls = 0;
 //static uint64_t cnt_CoTaskMemAllocCalls = 0;
 //static uint64_t cnt_CoTaskMemReallocCalls = 0;
-	Report(L"Hook call counts:\n");
+	Report(L"Hook call (and other) counts:\n");
 	Report(L"\t cnt_RtlAllocateCalls %llu, SkipLock %llu\n", cnt_RtlAllocateHeapCalls, cnt_RtlAllocateHeapSkippedLock);
 	Report(L"\t cnt_HeapAllocCalls %llu, SkipLock %llu\n", cnt_HeapAllocCalls, cnt_HeapAllocSkippedLock);
 	Report(L"\t cnt_RtlFreeHeapCalls %llu, SkipLock %llu\n", cnt_RtlFreeHeapCalls, cnt_RtlFreeHeapSkippedLock);
@@ -1176,4 +1384,5 @@ void ReportHookCallCounts()
 	Report(L"\t cnt_CoTaskMemAllocCalls %llu\n", cnt_CoTaskMemAllocCalls);
 	Report(L"\t cnt_CoTaskMemReallocCalls %llu\n", cnt_CoTaskMemReallocCalls);
     Report(L"vld internal Heap Handle %p (so can visually filter from windbg !heap -p -all or !heap 0 -a)\n",g_vldHeap);
+	PrintFlush();
 }

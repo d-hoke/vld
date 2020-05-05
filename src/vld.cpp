@@ -52,6 +52,8 @@ extern vldblockheader_t *g_vldBlockListDelayedFree;
 extern HANDLE            g_vldHeap;
 extern CriticalSection   g_vldHeapLock;
 
+extern void ReportHookCallCounts();
+
 // Global variables.
 HANDLE           g_currentProcess; // Pseudo-handle for the current process.
 HANDLE           g_currentThread;  // Pseudo-handle for the current thread.
@@ -357,6 +359,7 @@ VisualLeakDetector::VisualLeakDetector ()
     m_reportFile     = NULL;
     //wcsncpy_s(m_reportFilePath, MAX_PATH, VLD_DEFAULT_REPORT_FILE_NAME, _TRUNCATE);
     m_reportFilePath[0] = L'\0'; //fi - null gets generated filenames
+	m_reportFileOutputDirectory[0] = L'\0';
     m_status         = 0x0;
 
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
@@ -1231,7 +1234,9 @@ VOID VisualLeakDetector::configure ()
 		else
 			wcsncpy_s(filename, MAX_PATH, VLD_DEFAULT_REPORT_FILE_NAME, _TRUNCATE);
     }
-;;;;
+	//User needs to include trailing directory separator!!!
+	LoadStringOption(L"ReportOutputDirectory", m_reportFileOutputDirectory, MAX_PATH, inipath);
+	;;;;
     WCHAR* path;
 	if(filename[0] != '\0')
 	{
@@ -1395,6 +1400,23 @@ tls_t* VisualLeakDetector::getTls ()
     return tls;
 }
 
+HeapMap::Iterator VisualLeakDetector::findOrMapBlock(HANDLE heap)
+{
+    CriticalSectionLocker<> cs(g_heapMapLock); //needed? (done in reportLeaks(heap))
+    // Insert the block's information into the block map.
+	HeapMap::Iterator heapit = m_heapMap->find(heap);
+	if (heapit == m_heapMap->end()) {
+		// We haven't mapped this heap to a block map yet. Do it now.
+		mapHeap(heap);
+		heapit = m_heapMap->find(heap);
+		assert(heapit != m_heapMap->end());
+	}
+	return heapit;
+}
+HeapMap::Iterator findOrMapBlock(HANDLE heap)
+{
+	return g_vld.findOrMapBlock(heap);
+}
 // mapblock - Tracks memory allocations. Information about allocated blocks is
 //   collected and then the block is mapped to this information.
 //
@@ -1974,8 +1996,9 @@ VOID VisualLeakDetector::reportConfig ()
             Report(L"    Outputting the report to the debugger and to %S\n", m_reportFilePath[0]=='\0' ? L"<generated vls_snapshot_tstamp.txt>" : m_reportFilePath);
         }
         else {
-            Report(L"    Outputting the report to %S\n", m_reportFilePath[0]=='\0' ? L"<generated vls_snapshot_tstamp.txt>" : m_reportFilePath);
-        }
+            //Report(L"    Outputting the report to %S\n", m_reportFilePath[0]=='\0' ? L"<generated vls_snapshot_tstamp.txt>" : m_reportFilePath);
+			Report(L"    Outputting the report to %s\n", m_reportFilePath[0] == '\0' ? L"<generated vls_snapshot_tstamp.txt>" : m_reportFilePath);
+		}
     }
     if (m_options & VLD_OPT_SLOW_DEBUGGER_DUMP) {
         Report(L"    Outputting the report to the debugger at a slower rate.\n");
@@ -1992,6 +2015,7 @@ VOID VisualLeakDetector::reportConfig ()
     if (m_options & VLD_OPT_TRACE_INTERNAL_FRAMES) {
         Report(L"    Including heap and VLD internal frames in stack traces.\n");
     }
+	PrintFlush();
 }
 
 bool VisualLeakDetector::isDebugCrtAlloc( LPCVOID block, blockinfo_t* info )
@@ -2150,6 +2174,78 @@ SIZE_T VisualLeakDetector::reportHeapLeaks (HANDLE heap)
             leaks_count, (leaks_count > 1) ? L"s" : L"", heap);
      }
     return leaks_count;
+}
+
+void VisualLeakDetector::reportHeapCacheStats(HANDLE heap)
+{
+    assert(heap != NULL);
+
+    // Find the heap's information (blockmap, etc).
+    CriticalSectionLocker<> cs(g_heapMapLock);
+    HeapMap::Iterator heapit = m_heapMap->find(heap);
+    if (heapit == m_heapMap->end()) {
+        // Nothing is allocated from this heap. No leaks.
+        return;
+    }
+
+    Report(L"Currently Allocated\n");
+    heapinfo_t* heapinfo = (*heapit).second;
+    for (auto bkt = 0;
+        bkt < sizeof(heapinfo->cache.CacheAllocCounts) / sizeof(heapinfo->cache.CacheAllocCounts[0]);
+        bkt += 1
+        )
+    {
+        Report(L"bucket:\n");
+        for (auto slot = 0;
+            slot < sizeof(heapinfo->cache.CacheAllocCounts[0]) / sizeof(heapinfo->cache.CacheAllocCounts[0][0]);
+            slot += 1
+            )
+        {
+            Report(L"%u: %llu",slot, heapinfo->cache.CacheAllocCounts[bkt][slot]);
+        }
+        Report(L"\n");
+    }
+    Report(L"Currently Cached\n");
+    for (auto bkt = 0;
+        bkt < sizeof(heapinfo->cache.CacheListCounts) / sizeof(heapinfo->cache.CacheListCounts[0]);
+        bkt += 1
+        )
+    {
+        Report(L"bucket:\n");
+        for (auto slot = 0;
+            slot < sizeof(heapinfo->cache.CacheListCounts[0]) / sizeof(heapinfo->cache.CacheListCounts[0][0]);
+            slot += 1
+            )
+        {
+            Report(L"%u: %llu", slot, heapinfo->cache.CacheListCounts[bkt][slot]);
+        }
+        Report(L"\n");
+    }
+}
+
+void VisualLeakDetector::reportCacheStats()
+{
+    ReportHookCallCounts();
+
+    // Generate a memory leak report for each heap in the process.
+    CriticalSectionLocker<> cs(g_heapMapLock);
+    bool firstLeak = true;
+    static SIZE_T curHeapIdx;
+    curHeapIdx = 0;
+    for (HeapMap::Iterator heapit = m_heapMap->begin(); heapit != m_heapMap->end(); ++heapit) {
+        HANDLE heap = (*heapit).first;
+        heapinfo_t* heapinfo = (*heapit).second;
+        //.......................
+        //this is done inside the reportLeaks() that is about to be called, s'pose could pass it, ....
+        //..........................
+        Report(L"\n\n=========Reporting heap stats idx %llu, handle %p=============\n\n", curHeapIdx, heap);
+        ++curHeapIdx;
+        //UNREFERENCED_PARAMETER(heap);
+        //leaksCount += reportLeaks(heapinfo, firstLeak, aggregatedLeaks, -1, cntOfBlocks);
+        reportHeapCacheStats(heap);
+    }
+    ReportHookCallCounts(); //do 'em again, where's the tail of our file going?
+    PrintFlush();
 }
 
 int VisualLeakDetector::getCrtBlockUse(LPCVOID block, bool ucrt)
@@ -2844,7 +2940,6 @@ SIZE_T VisualLeakDetector::GetThreadLeaksCount(DWORD threadId)
     return leaksCount;
 }
 
-extern void ReportHookCallCounts();
 SIZE_T VisualLeakDetector::ReportLeaks( )
 {
     if (m_options & VLD_OPT_VLDOFF) {
@@ -2890,6 +2985,8 @@ SIZE_T VisualLeakDetector::ReportLeaks( )
         UNREFERENCED_PARAMETER(heap);
         leaksCount += reportLeaks(heapinfo, firstLeak, aggregatedLeaks, -1, cntOfBlocks);
     }
+	ReportHookCallCounts(); //do 'em again, where's the tail of our file going?
+	PrintFlush();
     return leaksCount;
 }
 
@@ -3168,7 +3265,7 @@ bool VisualLeakDetector::GetModulesList(WCHAR *modules, UINT size)
 
 //https://stackoverflow.com/questions/1425227/how-to-create-files-named-with-current-time
 #define LOGNAME_FORMAT "vld_snapshot_%Y.%m.%d_%H.%M.%S.c"
-void genfilename(WCHAR *snapshotfilename)
+void genfilename(WCHAR *snapshotfilename, WCHAR *outputdir)
 {
 	static unsigned cntr = 0 ;
     static char name[MAX_PATH];
@@ -3177,7 +3274,7 @@ void genfilename(WCHAR *snapshotfilename)
     //return fopen(name, "ab");
     //strcpy(snapshotfilename, name);
     //wcsncpy_s(snapshotfilename, MAX_PATH, name, _TRUNCATE);
-    swprintf(snapshotfilename, L"%S.c%u.txt", name, ++cntr);
+    swprintf(snapshotfilename, L"%s%S.c%u.txt", outputdir, name, ++cntr);
 }
 
 //NOTE: Apparently this wasn't used prior to FI changes for snapshotting...
@@ -3194,7 +3291,7 @@ void VisualLeakDetector::GetReportFilename(WCHAR *filename)
 		wcsncpy_s(filename, MAX_PATH, m_reportFilePath, _TRUNCATE);
 	else
 	{
-		genfilename(filename);
+		genfilename(filename, m_reportFileOutputDirectory);
 	}
 }
 

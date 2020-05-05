@@ -1189,12 +1189,23 @@ void GetFormattedMessage(DWORD last_error)
 HMODULE GetCallingModule( UINT_PTR pCaller )
 {
     HMODULE hModule = NULL;
+#if 01
+    //thanks to https://stackoverflow.com/questions/557081/how-do-i-get-the-hmodule-for-the-currently-executing-code
+    //Seeing if this is any faster than the virtualquery approach...
+    //... on windows 10 (some build, may 2020) appl being prof'd went from 3- fps to 25+/- fps, whoohoo!!!
+    //NB: XP+ solution!
+    GetModuleHandleEx(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCTSTR)pCaller,
+        &hModule);
+#else
     MEMORY_BASIC_INFORMATION mbi;
     if ( VirtualQuery((LPCVOID)pCaller, &mbi, sizeof(MEMORY_BASIC_INFORMATION)) == sizeof(MEMORY_BASIC_INFORMATION) )
     {
         // the allocation base is the beginning of a PE file
         hModule = (HMODULE) mbi.AllocationBase;
     }
+#endif
     return hModule;
 }
 

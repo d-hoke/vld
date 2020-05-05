@@ -159,12 +159,427 @@ typedef btree::btree_map<LPCVOID, blockinfo_t *, std::less<LPCVOID>, vld_stl_all
 //typedef btree_map<int, int> BlockMap2;
 
 
+
+struct POW2HeapBucketCacher
+{
+	//instead of powersof2, consider steps, maybe powers of 2 (min being 32, 2**5) up to 512/1024,
+	//or maybe just 32, 64, 128, 256 maybe to 1024
+	//or maybe just multiples of 32 to 1024... (32 buckets)
+	//then maybe
+	//multiples of 1024 to say 32k, (32 buckets)
+	//then multiples of 1024 to 64k, (32 buckets)
+	//then multiples of 2048 to 128k, (32 buckets)
+	//then multiples of 4096 to 256k (32 buckets)
+	//then multiples of 8192 to 512k (32 buckets)
+	//then multiples of 16384 to 1024k (1M) (32 buckets)
+	//then multiples of 32768 to 2048k (32 buckets)
+	//then multiples of 65536 to 4096k (32 buckets)
+	//then multiples of 128k to 8192k (32 buckets)
+	//then multiples of 256k to 16384k (32 buckets)
+	//then multiples of 512k to 32768k (32 buckets)
+	//multiples of 1024k for anything beyond?
+	//then what?
+	//std::mutex m_mtx;
+	CriticalSection cs;
+	static const size_t align = 32;
+	struct overhead
+	{
+		HANDLE heap;
+		size_t paddedsz;
+		union {
+			unsigned bucket;
+			overhead *next;
+		};
+		char fill[8]; // 16]; //size this for padding to 32 byte boundary (on x64 windows)
+	};
+	static HANDLE heapFromPointer(void *p)
+	{
+		return ((overhead *)((char*)p - padton(sizeof(overhead),align)))->heap;
+	}
+	static unsigned padton(unsigned val, unsigned padtomultipleval)
+	{
+		//return padto - ((n + padto) % padto);
+		return val + padtomultipleval - 1 - (val + padtomultipleval - 1) % padtomultipleval;
+	}
+	unsigned bucketfrompaddedn(size_t paddedn)
+	{
+		unsigned bucket = 0;
+		while ((paddedn >>= 1) && paddedn)
+		{
+			//hibit <<= 1;
+			++bucket;
+		}
+		return bucket;
+	}
+	POW2HeapBucketCacher()
+	{
+		//cs.Initialize();
+		memset(CacheLists, 0, sizeof(CacheLists));
+		memset(CacheListCounts, 0, sizeof(CacheListCounts));
+	}
+	size_t paddedsz(size_t n)
+	{
+		//const unsigned align = 32;
+		size_t paddedn = n + padton(sizeof(overhead), align);
+		return paddedn;
+	}
+	void *obtain(size_t paddedn)
+#if 0
+	;
+#else
+	{
+		unsigned bucket = bucketfrompaddedn(paddedn);
+
+		//FIXME: TBD: hmm, if bucket not right, then sz requested prob. isn't right...
+		//(and we'll be putting undersized item in bucket that would indicate its larger)
+		if (bucket < 5) //granularity on x64 windows
+		{
+			__debugbreak(); //TBD: See if this is reached...
+			bucket = 5;
+		}
+		else if (bucket > 63) //we double, so 63 is max...
+			__debugbreak();
+
+		void *pitem = CacheLists[bucket];
+		if (!pitem)
+		{
+			return nullptr ; //none currently cached
+			//pitem = malloc(paddedn);
+			//(*(overhead *)pitem).paddedsz = paddedn;
+			//(*(overhead *)pitem).bucket = bucket;
+		}
+		else
+		{
+			CacheLists[bucket] = ((overhead*)CacheLists[bucket])->next;
+			((overhead*)pitem)->bucket = bucket;
+			CacheListCounts[bucket]--;
+		}
+		//hmm, prob. need to deal with alignment...
+		//return (char*)pitem + padton(sizeof(overhead), 32);
+		return (char*)pitem + padton(sizeof(overhead), align);
+	}
+#endif
+
+	//void dealloc(void *p)
+	void release(void *p)
+#if 0
+		;
+#else
+	{
+		//overhead *itemtofree = (overhead*)((char*)p - padton(sizeof(overhead), 32));
+		overhead *itemtofree = (overhead*)((char*)p - padton(sizeof(overhead), align));
+		auto bucket = itemtofree->bucket;
+		itemtofree->next = CacheLists[bucket];
+		CacheLists[bucket] = itemtofree;
+		CacheListCounts[bucket]++;
+	}
+#endif
+	overhead *CacheLists[65];
+	size_t CacheListCounts[65];
+}; //POW2HeapBucketCacher
+
+#pragma optimize("", off)
+struct MultsOfHeapBucketCacher
+{
+    //instead of powersof2, consider steps, maybe powers of 2 (min being 32, 2**5) up to 512/1024,
+    //or maybe just 32, 64, 128, 256 maybe to 1024
+    //or maybe just multiples of 32 to 1024... (32 buckets)
+    //then maybe
+    //multiples of 1024 to say 32k, (32 buckets)
+    //then multiples of 1024 to 64k, (32 buckets)
+    //then multiples of 2048 to 128k, (32 buckets)
+    //then multiples of 4096 to 256k (32 buckets)
+    //then multiples of 8192 to 512k (32 buckets)
+    //then multiples of 16384 to 1024k (1M) (32 buckets)
+    //then multiples of 32768 to 2048k (32 buckets)
+    //then multiples of 65536 to 4096k (32 buckets)
+    //then multiples of 128k to 8192k (32 buckets)
+    //then multiples of 256k to 16384k (32 buckets)
+    //then multiples of 512k to 32768k (32 buckets)
+    //multiples of 1024k for anything beyond?
+    //then what?
+    //std::mutex m_mtx;
+    CriticalSection cs;
+    static const size_t align = 32;
+    struct overhead
+    {
+        HANDLE heap;
+        //size_t multsz;
+        uint32_t multofval;
+        uint32_t nmults;
+        union {
+            unsigned bucket;
+            overhead *next;
+        };
+        char fill[8]; // 16]; //size this for padding to 32 byte boundary (on x64 windows)
+    };
+    struct reqinfo
+    {
+        size_t reqsz; //user provided
+        size_t adjreqsz; //sz of overhead added in
+        size_t adjmultsz; //adjusted to some multiple of multofval, should == multofval * nmults
+        size_t multofval;
+        size_t nmults;
+        size_t bkt;
+    };
+    static HANDLE heapFromPointer(void *p)
+    {
+        return ((overhead *)((char*)p - padton(sizeof(overhead), align)))->heap;
+    }
+    static unsigned padton(unsigned val, unsigned padtomultipleval)
+    {
+        //return padto - ((n + padto) % padto);
+        return val + padtomultipleval - 1 - (val + padtomultipleval - 1) % padtomultipleval;
+    }
+#if 0
+    unsigned bucketfrompaddedn(size_t paddedn)
+    {
+        unsigned bucket = 0;
+        while ((paddedn >>= 1) && paddedn)
+        {
+            //hibit <<= 1;
+            ++bucket;
+        }
+        return bucket;
+    }
+#endif
+    MultsOfHeapBucketCacher()
+    {
+        //cs.Initialize();
+        memset(CacheLists, 0, sizeof(CacheLists));
+        memset(CacheListCounts, 0, sizeof(CacheListCounts));
+    }
+    size_t paddedsz(size_t n)
+    {
+        //const unsigned align = 32;
+        size_t paddedn = n + padton(sizeof(overhead), align);
+        return paddedn;
+    }
+
+    //void compvals(uint32_t &bkt, uint32_t &multof, uint32_t &nmult, size_t &size)
+    void compvals(reqinfo &ri)
+    {
+        //std::remove_reference<decltype(size)>::type adjsize1 = paddedsz(ri.reqsz);
+        ri.adjreqsz = paddedsz(ri.reqsz);
+        //std::remove_reference<decltype(size)>::type adjmultsize;
+        auto & adjsize1 = ri.adjreqsz;
+        auto & adjmultsize = ri.adjmultsz;
+        auto & bkt = ri.bkt;
+        auto & multof = ri.multofval;
+        auto & nmult = ri.nmults;
+        if (adjsize1 <= 1024)
+        {
+            bkt = 0;
+            multof = 32;
+            //adjmultsize = padton(32, align);
+            adjmultsize = padton(adjsize1, multof);
+            nmult = adjmultsize / multof;
+        }
+        else if(adjsize1 <= (1024 * 32)) //32k
+        {
+            bkt = 1;
+            multof = 1024;
+            //adjmultsize = padton(32, align);
+            adjmultsize = padton(adjsize1, multof);
+            nmult = adjmultsize / multof;
+        }
+        else if (adjsize1 <= (1024 * 64)) //64k
+        {
+            bkt = 2;
+            multof = 1024; //yes, same as 32k
+            //adjmultsize = padton(32, align);
+            adjmultsize = padton(adjsize1, multof);
+            nmult = adjmultsize / multof;
+        }
+        else if (adjsize1 <= (1024 * 128))
+        {
+            bkt = 3;
+            multof = 2048; 
+            //adjmultsize = padton(32, align);
+            adjmultsize = padton(adjsize1, multof);
+            nmult = adjmultsize / multof;
+        }
+        else if (adjsize1 <= (1024 * 256))
+        {
+            bkt = 4;
+            multof = 4096;
+            //adjmultsize = padton(32, align);
+            adjmultsize = padton(adjsize1, multof);
+            nmult = adjmultsize / multof;
+        }
+        else if (adjsize1 <= (1024 * 512))
+        {
+            bkt = 5;
+            multof = 8192;
+            //adjmultsize = padton(32, align);
+            adjmultsize = padton(adjsize1, multof);
+            nmult = adjmultsize / multof;
+        }
+        else if (adjsize1 <= (1024 * 1024))
+        {
+            bkt = 6;
+            multof = 16384;
+            //adjmultsize = padton(32, align);
+            adjmultsize = padton(adjsize1, multof);
+            nmult = adjmultsize / multof;
+        }
+        else if (adjsize1 <= (1024 * 2048))
+        {
+            bkt = 7;
+            multof = 32768;
+            //adjmultsize = padton(32, align);
+            adjmultsize = padton(adjsize1, multof);
+            nmult = adjmultsize / multof;
+        }
+        else if (adjsize1 <= (1024 * 4096))
+        {
+            bkt = 8;
+            multof = 65536; //1024*64
+            //adjmultsize = padton(32, align);
+            adjmultsize = padton(adjsize1, multof);
+            nmult = adjmultsize / multof;
+        }
+        else if (adjsize1 <= (1024 * 8192))
+        {
+            bkt = 9;
+            multof = 1024*128;
+            //adjmultsize = padton(32, align);
+            adjmultsize = padton(adjsize1, multof);
+            nmult = adjmultsize / multof;
+        }
+        else if (adjsize1 <= (1024 * 16384))
+        {
+            bkt = 10;
+            multof = 1024 * 256;
+            //adjmultsize = padton(32, align);
+            adjmultsize = padton(adjsize1, multof);
+            nmult = adjmultsize / multof;
+        }
+        else if (adjsize1 <= (1024 * 32768))
+        {
+            bkt = 11;
+            multof = 1024 * 512;
+            //adjmultsize = padton(32, align);
+            adjmultsize = padton(adjsize1, multof);
+            nmult = adjmultsize / multof;
+        }
+        else //if (adjsize1 <= (1024 * 32768))
+        {
+            bkt = 12;
+            multof = 1024 * 1024;
+            //adjmultsize = padton(32, align);
+            adjmultsize = padton(adjsize1, multof);
+            nmult = adjmultsize / multof;
+        }
+        if (nmult < 1 || (adjsize1 <= (1024 * 32768) && nmult > 32))
+            __debugbreak(); //diagnostic
+    }
+
+    void updateOverhead(overhead *poh, reqinfo &ri)
+    {
+        ((overhead*)poh)->bucket = ri.bkt;
+        ((overhead*)poh)->multofval = ri.multofval;
+        ((overhead*)poh)->nmults = ri.nmults;
+    }
+    //void *obtain(size_t &reqsz, overhead *&povrh)
+    void *obtain(reqinfo &ri)
+#if 0
+        ;
+#else
+    {
+        //unsigned bucket = bucketfrompaddedn(paddedn);
+        //unsigned bkt, multof, nmult;
+        //compvals(bkt, multof, nmult, reqsz);
+        compvals(ri);
+        auto &bkt = ri.bkt;
+        auto &nmult = ri.nmults;
+        auto &multof = ri.multofval;
+
+        void *pitem = CacheLists[bkt][nmult];
+        if (!pitem)
+        {
+            return nullptr; //none currently cached
+                            //pitem = malloc(paddedn);
+                            //(*(overhead *)pitem).paddedsz = paddedn;
+                            //(*(overhead *)pitem).bucket = bucket;
+        }
+        else
+        {
+            auto slot = nmult;
+            if (multof >= 1024 * 1024)
+                slot = 0;
+            CacheLists[bkt][slot] = ((overhead*)CacheLists[bkt][slot])->next;
+            //These actually ought to already be set!!! (tho' client has to do it, or req it be done!!!)
+            //maybe assert/warn if they are different? well, bkt needs to be set, others should be same...
+            //((overhead*)pitem)->bucket = bkt;
+            //((overhead*)pitem)->multofval = multof;
+            //((overhead*)pitem)->nmults = nmult;
+            updateOverhead((overhead *)pitem, ri);
+            CacheListCounts[bkt][slot]--;
+            CacheAllocCounts[bkt][slot]++;
+        }
+        //hmm, prob. need to deal with alignment...
+        //return (char*)pitem + padton(sizeof(overhead), 32);
+        return (char*)pitem + padton(sizeof(overhead), align);
+    }
+    void *adj2userdata(void *pblk)
+    {
+        //user writeable area
+        return (char*)pblk + padton(sizeof(overhead), align);
+    }
+    void *adj2blkstart(void *pblk)
+    {
+        //addr of prefix overhead
+        return (char*)pblk - padton(sizeof(overhead), align);
+    }
+
+    void incrAllocCount(reqinfo &ri)
+    {
+        auto slot = ri.nmults;
+        if (ri.multofval >= 1024 * 1024)
+            slot = 0;
+        auto &bkt = ri.bkt;
+        CacheAllocCounts[bkt][slot]++;
+    }
+#endif
+    void setovrh(void *p, overhead *povrhsrc)
+    {
+        overhead *povrh2set = (overhead*)((char*)p - padton(sizeof(overhead), align));
+        povrh2set->bucket    = povrhsrc->bucket;
+        povrh2set->multofval = povrhsrc->multofval;
+        povrh2set->nmults    = povrhsrc->nmults;
+    }
+    //void dealloc(void *p)
+    void release(void *p)
+#if 0
+        ;
+#else
+    {
+        //overhead *itemtofree = (overhead*)((char*)p - padton(sizeof(overhead), 32));
+        overhead *itemtofree = (overhead*)((char*)p - padton(sizeof(overhead), align));
+        auto bucket = itemtofree->bucket;
+        auto slot = itemtofree->nmults;
+        if (slot >= 1024 * 1024)
+            slot = 0;
+        itemtofree->next = CacheLists[bucket][slot];
+        CacheLists[bucket][slot] = itemtofree;
+        CacheListCounts[bucket][slot]++;
+        CacheAllocCounts[bucket][slot]--;
+    }
+#endif
+    overhead *CacheLists[16][33]; //32+1 so don't have to zero-base nmult(s) value
+    size_t CacheListCounts[16][33]; //same here
+    size_t CacheAllocCounts[16][33];
+}; //MultsOfHeapBucketCacher
+
 // Information about each heap in the process is kept in this map. Primarily
 // this is used for mapping heaps to all of the blocks allocated from those
 // heaps.
 struct heapinfo_t {
     BlockMap blockMap;   // Map of all blocks allocated from this heap.
     UINT32   flags;      // Heap status flags
+	//POW2HeapBucketCacher cache;
+    MultsOfHeapBucketCacher cache;
 };
 
 // HeapMaps map heaps (via their handles) to BlockMaps.
@@ -346,10 +761,14 @@ public:
 	};
 
     void reportSomeStats();
+    void reportHeapCacheStats(HANDLE heap);
+    void reportCacheStats();
 
     bool m_avoidFills;
     uint32_t m_checkpointval;
     decltype(m_checkpointval) BumpCheckPoint() { return ++m_checkpointval; }
+
+	HeapMap::Iterator findOrMapBlock(HANDLE heap);
 
 private:
     ////////////////////////////////////////////////////////////////////////////////
@@ -365,7 +784,7 @@ private:
     SIZE_T eraseDuplicates(const BlockMap::iterator &element, Set<blockinfo_t*> &aggregatedLeak);
     //SIZE_T eraseDuplicates(blockinfo_t *elementinfo, Set<blockinfo_t*> &aggregatedLeak);
     tls_t* getTls ();
-    VOID   mapBlock (HANDLE heap, LPCVOID mem, SIZE_T size, bool crtalloc, bool ucrt, DWORD threadId, blockinfo_t* &pblockInfo, const context_t &context, unsigned flags=0);
+	VOID   mapBlock (HANDLE heap, LPCVOID mem, SIZE_T size, bool crtalloc, bool ucrt, DWORD threadId, blockinfo_t* &pblockInfo, const context_t &context, unsigned flags=0);
     VOID   mapHeap (HANDLE heap);
     VOID   remapBlock (HANDLE heap, LPCVOID mem, LPCVOID newmem, SIZE_T size,
         bool crtalloc, bool ucrt, DWORD threadId, blockinfo_t* &pblockInfo, const context_t &context);
@@ -446,7 +865,8 @@ private:
     static moduleentry_t m_patchTable [58];   // Table of imports patched for attaching VLD to other modules.
     FILE                *m_reportFile;        // File where the memory leak report may be sent to.
     WCHAR                m_reportFilePath [MAX_PATH]; // Full path and name of file to send memory leak report to.
-    const char          *m_selfTestFile;      // Filename where the memory leak self-test block is leaked.
+	WCHAR                m_reportFileOutputDirectory[MAX_PATH]; // Full path and name of file to send memory leak report to.
+	const char          *m_selfTestFile;      // Filename where the memory leak self-test block is leaked.
     int                  m_selfTestLine;      // Line number where the memory leak self-test block is leaked.
     UINT32               m_status;            // Status flags:
 #define VLD_STATUS_DBGHELPLINKED        0x1   //   If set, the explicit dynamic link to the Debug Help Library succeeded.

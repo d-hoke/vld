@@ -1139,7 +1139,10 @@ class btree : public Params::key_compare {
     if (root()->leaf()) return root()->count();
     return root()->size();
   }
+#pragma push_macro("max")
+#undef max
   size_type max_size() const { return std::numeric_limits<size_type>::max(); }
+#pragma pop_macro("max")
   bool empty() const { return root() == NULL; }
 
   // The height of the btree. An empty tree will have height 0.
